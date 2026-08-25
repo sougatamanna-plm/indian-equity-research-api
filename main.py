@@ -270,6 +270,76 @@ def nse_index_constituents(
     )
 
 
+@app.get("/nse/stock-index-membership")
+def nse_stock_index_membership(
+    symbol: str = Query(
+        ...,
+        description="NSE equity symbol, e.g. RELIANCE, TCS, NETWEB"
+    )
+):
+    """
+    Return all NSE indices to which a stock belongs.
+
+    Uses NSE's current NextApi getIndexList function.
+    """
+
+    symbol_name = symbol.strip().upper()
+
+    if not symbol_name:
+        raise HTTPException(
+            status_code=400,
+            detail="A valid NSE stock symbol is required."
+        )
+
+    try:
+        payload = nse_api_get(
+            "/api/NextApi/apiClient/GetQuoteApi",
+            params={
+                "functionName": "getIndexList",
+                "symbol": symbol_name
+            }
+        )
+
+        if isinstance(payload, dict):
+            data = payload.get("data", [])
+
+            # Some NSE responses may use a different top-level
+            # structure. Preserve the complete response.
+            if not data:
+                for key in ("indexList", "indices", "equityResponse"):
+                    if isinstance(payload.get(key), list):
+                        data = payload.get(key)
+                        break
+        else:
+            data = payload
+
+        if data is None:
+            data = []
+
+        if not isinstance(data, list):
+            data = [data]
+
+        return {
+            "source": "NSE",
+            "symbol": symbol_name,
+            "endpoint": "/api/NextApi/apiClient/GetQuoteApi",
+            "functionName": "getIndexList",
+            "count": len(data),
+            "indices": data,
+            "raw": payload
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"NSE index-membership data unavailable "
+                f"for symbol '{symbol_name}'. "
+                f"Underlying error: {str(e)}"
+            )
+        )
+
+
 @app.get("/")
 def root():
     return {
