@@ -212,6 +212,136 @@ def nse_api_get(path, params=None, retries=2):
 
 
 # ---------------------------------------------------------
+# NSE equity quote / company data
+# ---------------------------------------------------------
+_QUOTE_CACHE = {}
+_QUOTE_CACHE_LOCK = Lock()
+
+
+def _get_equity_quote_cached(symbol, section=None):
+    """Fetch NSE's current equity quote endpoint with caching."""
+    symbol_name = _normalize_symbol(symbol)
+    if not symbol_name:
+        raise ValueError("A valid NSE equity symbol is required.")
+
+    section_name = (
+        str(section).strip()
+        if section is not None and str(section).strip()
+        else None
+    )
+    cache_key = (symbol_name, section_name)
+
+    with _QUOTE_CACHE_LOCK:
+        if cache_key in _QUOTE_CACHE:
+            return _QUOTE_CACHE[cache_key]
+
+    params = {"symbol": symbol_name}
+    if section_name:
+        params["section"] = section_name
+
+    errors = []
+
+    try:
+        payload = nse_api_get("/api/quote-equity", params=params)
+        result = {
+            "source": "NSE",
+            "symbol": symbol_name,
+            "endpoint": "/api/quote-equity",
+            "section": section_name,
+            "data": payload,
+        }
+        with _QUOTE_CACHE_LOCK:
+            _QUOTE_CACHE[cache_key] = result
+        return result
+    except Exception as e:
+        errors.append(f"quote-equity: {str(e)}")
+
+    # Fallback for the normal quote request. NSE's NextApi getSymbolData
+    # exposes a rich single-symbol response.
+    if section_name is None:
+        try:
+            payload = nse_api_get(
+                "/api/NextApi/apiClient/GetQuoteApi",
+                params={
+                    "functionName": "getSymbolData",
+                    "marketType": "N",
+                    "series": "EQ",
+                    "symbol": symbol_name,
+                }
+            )
+            result = {
+                "source": "NSE",
+                "symbol": symbol_name,
+                "endpoint": "/api/NextApi/apiClient/GetQuoteApi",
+                "functionName": "getSymbolData",
+                "section": None,
+                "fallback": True,
+                "data": payload,
+                "errors": errors,
+            }
+            with _QUOTE_CACHE_LOCK:
+                _QUOTE_CACHE[cache_key] = result
+            return result
+        except Exception as e:
+            errors.append(f"getSymbolData fallback: {str(e)}")
+
+    raise RuntimeError(
+        f"NSE equity quote unavailable for '{symbol_name}'. "
+        + " | ".join(errors)
+    )
+
+
+@app.get("/nse/quote-equity")
+def nse_quote_equity(
+    symbol: str = Query(
+        ...,
+        description="NSE equity symbol, e.g. RELIANCE, TCS, NETWEB"
+    ),
+    section: str | None = Query(
+        None,
+        description="Optional NSE quote section. Use 'trade_info' for liquidity and delivery data."
+    )
+):
+    """Return current NSE quote data for one equity."""
+    symbol_name = symbol.strip().upper()
+    if not symbol_name:
+        raise HTTPException(status_code=400, detail="A valid NSE stock symbol is required.")
+    try:
+        return _get_equity_quote_cached(symbol_name, section)
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"NSE equity quote unavailable for symbol '{symbol_name}'. Underlying error: {str(e)}"
+        )
+
+
+@app.get("/nse/equity-meta-info")
+def nse_equity_meta_info(
+    symbol: str = Query(
+        ...,
+        description="NSE equity symbol, e.g. RELIANCE, TCS, NETWEB"
+    )
+):
+    """Return NSE company/entity metadata for one equity."""
+    symbol_name = symbol.strip().upper()
+    if not symbol_name:
+        raise HTTPException(status_code=400, detail="A valid NSE stock symbol is required.")
+    try:
+        payload = nse_api_get("/api/equity-meta-info", params={"symbol": symbol_name})
+        return {
+            "source": "NSE",
+            "symbol": symbol_name,
+            "endpoint": "/api/equity-meta-info",
+            "data": payload,
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"NSE equity metadata unavailable for symbol '{symbol_name}'. Underlying error: {str(e)}"
+        )
+
+
+# ---------------------------------------------------------
 # Master NSE equity universe helpers
 # ---------------------------------------------------------
 def _normalize_symbol(value):
@@ -1203,8 +1333,8 @@ def root():
     return {
         "service": "Indian Equity Research API",
         "status": "online",
-        "version": "0.4.0",
-        "data_layers": ["NSE", "master-universe", "index-catalogue", "index-constituents", "index-union", "master-discovery", "index-membership"],
+        "version": "0.5.0",
+        "data_layers": ["NSE", "equity-quote", "equity-meta-info", "master-universe", "index-catalogue", "index-constituents", "index-union", "master-discovery", "index-membership"],
     }
 
 
