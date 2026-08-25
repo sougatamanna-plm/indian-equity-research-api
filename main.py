@@ -49,7 +49,7 @@ INDEX_CONSTITUENT_WORKERS = 4
 app = FastAPI(
     title="Indian Equity Research API",
     description="Free NSE/BSE research data gateway",
-    version="0.6.1"
+    version="0.6.2"
 )
 
 
@@ -1425,12 +1425,168 @@ def _validate_date_range(from_date, to_date, max_days=None):
 # ---------------------------------------------------------
 # Historical equity price data
 # ---------------------------------------------------------
-def _get_historical_equity_chunk(params):
-    """Fetch one NSE historical-equity window with JSON/CSV fallbacks.
+def _clean_text(value):
+    if value is None:
+        return ""
+    return str(value).replace("\ufeff", "").strip()
 
-    NSE's historical endpoint can return JSON in normal browser/API flows but
-    may return a CSV download (or a non-JSON response) depending on headers,
-    session state and anti-bot handling. Do not force response.json().
+
+def _to_float(value):
+    if value is None:
+        return None
+    raw = _clean_text(value).replace(",", "")
+    if raw in {"", "-", "--", "NA", "N/A", "NULL", "NONE"}:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_row_date(value):
+    """Best-effort parser for NSE historical/bhavcopy date fields."""
+    raw = _clean_text(value)
+    if not raw:
+        return None
+    raw = raw.split("T", 1)[0].split(" ", 1)[0].strip()
+    for fmt in (
+        "%d-%b-%Y", "%d-%B-%Y", "%d-%m-%Y", "%Y-%m-%d",
+        "%Y/%m/%d", "%d/%m/%Y", "%d%m%Y",
+    ):
+        try:
+            return datetime.strptime(raw.upper(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _historical_row_date(row):
+    if not isinstance(row, dict):
+        return None
+    for key in (
+        "CH_TIMESTAMP", "mTIMESTAMP", "TIMESTAMP", "DATE1", "date",
+        "Date", "DATE", "TRADE_DATE", "TRADING_DATE",
+    ):
+        parsed = _parse_row_date(row.get(key))
+        if parsed:
+            return parsed
+    return None
+
+
+def _historical_row_close(row):
+    if not isinstance(row, dict):
+        return None
+    for key in (
+        "CH_CLOSING_PRICE", "CLOSE_PRICE", "CLOSE", "close",
+        "closingPrice", "lastPrice", "LAST_PRICE",
+    ):
+        value = _to_float(row.get(key))
+        if value is not None and value > 0:
+            return value
+    return None
+
+
+def _historical_row_symbol(row):
+    if not isinstance(row, dict):
+        return None
+    for key in ("CH_SYMBOL", "SYMBOL", "symbol", "Symbol"):
+        value = _normalize_symbol(row.get(key))
+        if value:
+            return value
+    return None
+
+
+def _is_valid_historical_row(row, expected_symbol=None, start=None, end=None):
+    """
+    Reject HTML/error fragments and malformed records.
+
+    A historical observation must contain a recognizable date and positive
+    close. If the source supplies a symbol, it must match the requested
+    symbol. The date must fall inside the requested window.
+    """
+    if not isinstance(row, dict) or not row:
+        return False
+
+    joined = " ".join(
+        _clean_text(v).lower()
+        for v in row.values()
+        if isinstance(v, (str, int, float))
+    )[:4000]
+
+    if any(
+        marker in joined
+        for marker in (
+            "service temporarily unavailable", "<html", "<!doctype",
+            "access denied", "captcha", "cloudflare",
+            "bad gateway", "internal server error",
+        )
+    ):
+        return False
+
+    row_date = _historical_row_date(row)
+    close = _historical_row_close(row)
+
+    if row_date is None or close is None:
+        return False
+
+    if start and row_date < start.date():
+        return False
+    if end and row_date > end.date():
+        return False
+
+    row_symbol = _historical_row_symbol(row)
+    if expected_symbol and row_symbol and row_symbol != expected_symbol:
+        return False
+
+    return True
+
+
+def _validate_historical_rows(rows, expected_symbol=None, start=None, end=None):
+    valid = []
+    invalid = 0
+
+    if not isinstance(rows, list):
+        return [], 0
+
+    for row in rows:
+        if _is_valid_historical_row(
+            row, expected_symbol=expected_symbol, start=start, end=end
+        ):
+            valid.append(row)
+        else:
+            invalid += 1
+
+    dedup = {}
+    for row in valid:
+        row_date = _historical_row_date(row)
+        if row_date:
+            dedup[row_date.isoformat()] = row
+
+    result = list(dedup.values())
+    result.sort(key=lambda row: _historical_row_date(row).isoformat())
+    return result, invalid
+
+
+def _historical_expected_weekdays(start, end):
+    if start is None or end is None:
+        return None
+    current = start.date()
+    finish = end.date()
+    count = 0
+    while current <= finish:
+        if current.weekday() < 5:
+            count += 1
+        current += timedelta(days=1)
+    return count
+
+
+def _get_historical_equity_chunk(params):
+    """
+    Primary historical route.
+
+    Try NSE JSON first, then the CSV form of the same endpoint. Every
+    response is validated by the caller before it becomes market data.
+    HTML/error pages are never accepted as historical observations.
     """
     path = "/api/historical/cm/equity"
     last_errors = []
@@ -1451,12 +1607,17 @@ def _get_historical_equity_chunk(params):
                 "Chrome/146.0.0.0 Safari/537.36"
             ),
         }
+
         try:
-            response = session.get(NSE_BASE + path, params=params, headers=headers, timeout=40)
-            text = response.text.lstrip("\ufeff \r\n\t")
+            response = session.get(
+                NSE_BASE + path, params=params, headers=headers, timeout=40
+            )
+            text_body = response.text.lstrip("\ufeff \r\n\t")
 
             if response.status_code in {401, 403, 429} or response.status_code >= 500:
-                last_errors.append(f"HTTP {response.status_code}: {text[:300]}")
+                last_errors.append(
+                    f"HTTP {response.status_code}: {text_body[:300]}"
+                )
                 with _NSE_SESSION_LOCK:
                     global _nse_session
                     _nse_session = None
@@ -1465,38 +1626,43 @@ def _get_historical_equity_chunk(params):
 
             response.raise_for_status()
 
-            # Preferred JSON response: {"data": [...]}
-            if text.startswith("{") or text.startswith("["):
+            if text_body.startswith("{") or text_body.startswith("["):
                 try:
                     payload = response.json()
                     rows = _unwrap_records(payload)
                     if rows:
-                        return rows
-                    # Preserve an explicit empty valid JSON response.
+                        return {"rows": rows, "transport": "json"}
                     if isinstance(payload, dict) and "data" in payload:
-                        return rows
+                        return {"rows": [], "transport": "json"}
                 except ValueError as exc:
                     last_errors.append(f"JSON parse failed: {exc}")
 
-            # Fallback: NSE supports a CSV download form.
             csv_params = dict(params)
             csv_params["csv"] = "true"
             csv_headers = dict(headers)
             csv_headers["Accept"] = "text/csv,text/plain,*/*"
+
             csv_response = session.get(
-                NSE_BASE + path, params=csv_params, headers=csv_headers, timeout=40
+                NSE_BASE + path,
+                params=csv_params,
+                headers=csv_headers,
+                timeout=40,
             )
-            csv_text = csv_response.content.decode("utf-8-sig", errors="replace")
+            csv_text = csv_response.content.decode(
+                "utf-8-sig", errors="replace"
+            )
+
             if csv_response.ok and csv_text.strip():
                 reader = csv.DictReader(io.StringIO(csv_text))
                 rows = [dict(row) for row in reader]
                 if rows:
-                    return rows
+                    return {"rows": rows, "transport": "csv"}
 
             last_errors.append(
-                f"Non-JSON historical response: status={response.status_code}, "
+                f"Non-usable historical response: "
+                f"status={response.status_code}, "
                 f"content-type={response.headers.get('content-type')}, "
-                f"body={text[:200]!r}"
+                f"body={text_body[:200]!r}"
             )
         except Exception as exc:
             last_errors.append(str(exc))
@@ -1507,6 +1673,234 @@ def _get_historical_equity_chunk(params):
     raise RuntimeError(" | ".join(last_errors))
 
 
+def _get_nse_full_bhavcopy_for_date(session, trading_date, symbol):
+    """
+    Free NSE Full Bhavcopy + Security Deliverable fallback.
+
+    Current NSE reports expose:
+        sec_bhavdata_full_DDMMYYYY.csv
+    """
+    date_token = trading_date.strftime("%d%m%Y")
+    url = (
+        "https://nsearchives.nseindia.com/products/content/"
+        f"sec_bhavdata_full_{date_token}.csv"
+    )
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/146.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/csv,text/plain,*/*",
+        "Accept-Language": "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": NSE_BASE + "/all-reports",
+        "Connection": "keep-alive",
+    }
+
+    try:
+        response = session.get(url, headers=headers, timeout=40)
+
+        if response.status_code == 404:
+            return {"status": "not_available", "date": trading_date.isoformat()}
+
+        response.raise_for_status()
+        content = response.content.decode("utf-8-sig", errors="replace")
+
+        if not content.strip():
+            return {"status": "empty", "date": trading_date.isoformat()}
+
+        probe = content.lstrip().lower()[:1000]
+        if (
+            probe.startswith("<html")
+            or probe.startswith("<!doctype")
+            or "service temporarily unavailable" in probe
+            or "access denied" in probe
+            or "captcha" in probe
+        ):
+            return {
+                "status": "invalid_response",
+                "date": trading_date.isoformat(),
+            }
+
+        reader = csv.DictReader(io.StringIO(content))
+        target = _normalize_symbol(symbol)
+        wanted = None
+
+        for row in reader:
+            if _historical_row_symbol(row) == target:
+                wanted = row
+                break
+
+        if wanted is None:
+            return {
+                "status": "symbol_not_found",
+                "date": trading_date.isoformat(),
+            }
+
+        close = _to_float(
+            wanted.get("CLOSE_PRICE")
+            or wanted.get("CH_CLOSING_PRICE")
+            or wanted.get("CLOSE")
+        )
+        if close is None or close <= 0:
+            return {
+                "status": "invalid_row",
+                "date": trading_date.isoformat(),
+            }
+
+        turnover_lacs = _to_float(wanted.get("TURNOVER_LACS"))
+
+        normalized = dict(wanted)
+        normalized.update({
+            "CH_SYMBOL": target,
+            "CH_TIMESTAMP": trading_date.strftime("%d-%b-%Y"),
+            "CH_OPENING_PRICE": (
+                wanted.get("OPEN_PRICE")
+                or wanted.get("CH_OPENING_PRICE")
+            ),
+            "CH_TRADE_HIGH_PRICE": (
+                wanted.get("HIGH_PRICE")
+                or wanted.get("CH_TRADE_HIGH_PRICE")
+            ),
+            "CH_TRADE_LOW_PRICE": (
+                wanted.get("LOW_PRICE")
+                or wanted.get("CH_TRADE_LOW_PRICE")
+            ),
+            "CH_CLOSING_PRICE": (
+                wanted.get("CLOSE_PRICE")
+                or wanted.get("CH_CLOSING_PRICE")
+            ),
+            "CH_TOT_TRADED_QTY": (
+                wanted.get("TTL_TRD_QNTY")
+                or wanted.get("CH_TOT_TRADED_QTY")
+            ),
+            "CH_TOT_TRADED_VAL": (
+                turnover_lacs * 100000
+                if turnover_lacs is not None
+                else wanted.get("CH_TOT_TRADED_VAL")
+            ),
+            "CH_TOTAL_TRADES": (
+                wanted.get("NO_OF_TRADES")
+                or wanted.get("CH_TOTAL_TRADES")
+            ),
+            "CH_DELIV_QTY": (
+                wanted.get("DELIV_QTY")
+                or wanted.get("CH_DELIV_QTY")
+            ),
+            "CH_DELIV_PER": (
+                wanted.get("DELIV_PER")
+                or wanted.get("CH_DELIV_PER")
+            ),
+        })
+
+        return {
+            "status": "valid",
+            "date": trading_date.isoformat(),
+            "row": normalized,
+        }
+
+    except requests.RequestException as exc:
+        return {
+            "status": "request_error",
+            "date": trading_date.isoformat(),
+            "error": str(exc),
+        }
+    except Exception as exc:
+        return {
+            "status": "parse_error",
+            "date": trading_date.isoformat(),
+            "error": str(exc),
+        }
+
+
+def _get_historical_equity_bhavcopy_fallback(
+    symbol, start, end, series="EQ"
+):
+    """
+    Build validated history from NSE's free daily Full Bhavcopy +
+    Security Deliverable archive. Weekends are skipped; unavailable
+    dates are recorded instead of becoming fake observations.
+    """
+    target = _normalize_symbol(symbol)
+    if not target:
+        raise ValueError("A valid NSE equity symbol is required.")
+
+    session = get_nse_session()
+    rows = []
+    errors = []
+    unavailable_dates = []
+    invalid_dates = []
+
+    current = start.date()
+    finish = end.date()
+
+    while current <= finish:
+        if current.weekday() < 5:
+            result = _get_nse_full_bhavcopy_for_date(
+                session=session,
+                trading_date=current,
+                symbol=target,
+            )
+            status = result.get("status")
+
+            if status == "valid":
+                row = result.get("row")
+                if _is_valid_historical_row(
+                    row,
+                    expected_symbol=target,
+                    start=start,
+                    end=end,
+                ):
+                    rows.append(row)
+                else:
+                    invalid_dates.append(current.isoformat())
+            elif status in {
+                "not_available", "empty", "symbol_not_found"
+            }:
+                unavailable_dates.append(current.isoformat())
+            else:
+                errors.append({
+                    "date": current.isoformat(),
+                    "status": status,
+                    "error": result.get("error"),
+                })
+
+            # Conservative archive rate to reduce NSE throttling risk.
+            time.sleep(0.20)
+
+        current += timedelta(days=1)
+
+    dedup = {}
+    for row in rows:
+        row_date = _historical_row_date(row)
+        if row_date:
+            dedup[row_date.isoformat()] = row
+
+    rows = list(dedup.values())
+    rows.sort(key=lambda row: _historical_row_date(row).isoformat())
+
+    return {
+        "source": "NSE_Bhavcopy_Fallback",
+        "symbol": target,
+        "series": str(series or "EQ").strip().upper(),
+        "from_date": _format_nse_date(start),
+        "to_date": _format_nse_date(end),
+        "count": len(rows),
+        "data": rows,
+        "fallback_used": True,
+        "data_quality": "VALID" if rows else "UNAVAILABLE",
+        "expected_weekdays": _historical_expected_weekdays(start, end),
+        "valid_observations": len(rows),
+        "unavailable_dates_count": len(unavailable_dates),
+        "invalid_dates_count": len(invalid_dates),
+        "fallback_error_count": len(errors),
+        "unavailable_dates": unavailable_dates[:50],
+        "invalid_dates": invalid_dates[:50],
+        "fallback_errors": errors[:50],
+    }
+
+
 def _get_historical_equity(symbol, from_date, to_date, series="EQ"):
     symbol_name = _normalize_symbol(symbol)
     if not symbol_name:
@@ -1514,6 +1908,7 @@ def _get_historical_equity(symbol, from_date, to_date, series="EQ"):
 
     start = _parse_ddmmyyyy(from_date, "from_date")
     end = _parse_ddmmyyyy(to_date, "to_date")
+
     if start is None:
         end = end or datetime.now()
         start = end - timedelta(days=30)
@@ -1534,9 +1929,11 @@ def _get_historical_equity(symbol, from_date, to_date, series="EQ"):
         if cache_key in _HISTORICAL_CACHE:
             return _HISTORICAL_CACHE[cache_key]
 
-    # NSE's historical equity API is commonly limited to roughly one year.
-    # Chunk long requests rather than silently returning incomplete history.
     chunks = []
+    primary_errors = []
+    invalid_primary_rows = 0
+    primary_transport = []
+
     cursor = start
     while cursor <= end:
         chunk_end = min(cursor + timedelta(days=360), end)
@@ -1546,64 +1943,146 @@ def _get_historical_equity(symbol, from_date, to_date, series="EQ"):
             "from": _format_nse_date(cursor),
             "to": _format_nse_date(chunk_end),
         }
-        rows = _get_historical_equity_chunk(params)
-        chunks.extend(rows)
+
+        try:
+            response = _get_historical_equity_chunk(params)
+            raw_rows = response.get("rows", [])
+            if response.get("transport"):
+                primary_transport.append(response["transport"])
+
+            valid_rows, invalid_count = _validate_historical_rows(
+                raw_rows,
+                expected_symbol=symbol_name,
+                start=cursor,
+                end=chunk_end,
+            )
+            invalid_primary_rows += invalid_count
+
+            if raw_rows and not valid_rows:
+                primary_errors.append(
+                    f"{_format_nse_date(cursor)} to "
+                    f"{_format_nse_date(chunk_end)}: "
+                    f"received {len(raw_rows)} rows but 0 valid market rows"
+                )
+                chunks = []
+                break
+
+            chunks.extend(valid_rows)
+        except Exception as exc:
+            primary_errors.append(
+                f"{_format_nse_date(cursor)} to "
+                f"{_format_nse_date(chunk_end)}: {str(exc)}"
+            )
+            chunks = []
+            break
+
         cursor = chunk_end + timedelta(days=1)
 
-    # De-duplicate by date when an upstream response overlaps a boundary.
     dedup = {}
     for row in chunks:
-        if not isinstance(row, dict):
-            continue
-        stamp = (
-            row.get("CH_TIMESTAMP")
-            or row.get("mTIMESTAMP")
-            or row.get("date")
-            or row.get("Date")
-        )
-        key = str(stamp) if stamp is not None else json.dumps(row, sort_keys=True)
-        dedup[key] = row
+        row_date = _historical_row_date(row)
+        if row_date:
+            dedup[row_date.isoformat()] = row
 
-    rows = list(dedup.values())
-    rows.sort(
-        key=lambda x: str(
-            x.get("CH_TIMESTAMP")
-            or x.get("mTIMESTAMP")
-            or x.get("date")
-            or x.get("Date")
-            or ""
-        )
+    primary_rows = list(dedup.values())
+    primary_rows.sort(
+        key=lambda row: _historical_row_date(row).isoformat()
     )
 
-    result = {
-        "source": "NSE",
-        "symbol": symbol_name,
-        "series": series_name,
-        "from_date": _format_nse_date(start),
-        "to_date": _format_nse_date(end),
-        "count": len(rows),
-        "endpoint": "/api/historical/cm/equity",
-        "data": rows,
-    }
+    expected_weekdays = _historical_expected_weekdays(start, end)
+    primary_valid = bool(primary_rows)
+    primary_complete_enough = (
+        primary_valid
+        and expected_weekdays is not None
+        and len(primary_rows) >= max(1, int(expected_weekdays * 0.80))
+    )
+
+    if primary_valid and primary_complete_enough and not primary_errors:
+        result = {
+            "source": "NSE",
+            "symbol": symbol_name,
+            "series": series_name,
+            "from_date": _format_nse_date(start),
+            "to_date": _format_nse_date(end),
+            "count": len(primary_rows),
+            "endpoint": "/api/historical/cm/equity",
+            "data": primary_rows,
+            "fallback_used": False,
+            "data_quality": "VALID",
+            "expected_weekdays": expected_weekdays,
+            "valid_observations": len(primary_rows),
+            "invalid_primary_rows": invalid_primary_rows,
+            "fallback_error_count": 0,
+            "primary_errors": [],
+            "primary_transport": sorted(set(primary_transport)),
+        }
+        with _HISTORICAL_CACHE_LOCK:
+            _HISTORICAL_CACHE[cache_key] = result
+        return result
+
+    fallback = _get_historical_equity_bhavcopy_fallback(
+        symbol=symbol_name,
+        start=start,
+        end=end,
+        series=series_name,
+    )
+    fallback["primary_errors"] = primary_errors[:50]
+    fallback["invalid_primary_rows"] = invalid_primary_rows
+    fallback["primary_transport"] = sorted(set(primary_transport))
+    expected = fallback.get("expected_weekdays")
+    observed = fallback.get("count", 0)
+
+    if observed:
+        fallback["data_quality"] = (
+            "PARTIAL"
+            if expected and observed < max(1, int(expected * 0.80))
+            else "VALID"
+        )
+    else:
+        fallback["data_quality"] = "UNAVAILABLE"
+
+    fallback["endpoint"] = (
+        "https://nsearchives.nseindia.com/products/content/"
+        "sec_bhavdata_full_DDMMYYYY.csv"
+    )
+
     with _HISTORICAL_CACHE_LOCK:
-        _HISTORICAL_CACHE[cache_key] = result
-    return result
+        _HISTORICAL_CACHE[cache_key] = fallback
+
+    return fallback
 
 
 @app.get("/nse/historical-equity")
 def nse_historical_equity(
-    symbol: str = Query(..., description="NSE equity symbol, e.g. NETWEB, DIXON, KAYNES"),
-    from_date: str | None = Query(None, description="Start date: DD-MM-YYYY or YYYY-MM-DD"),
-    to_date: str | None = Query(None, description="End date: DD-MM-YYYY or YYYY-MM-DD"),
+    symbol: str = Query(
+        ..., description="NSE equity symbol, e.g. NETWEB, DIXON, KAYNES"
+    ),
+    from_date: str | None = Query(
+        None, description="Start date: DD-MM-YYYY or YYYY-MM-DD"
+    ),
+    to_date: str | None = Query(
+        None, description="End date: DD-MM-YYYY or YYYY-MM-DD"
+    ),
     series: str = Query("EQ", description="NSE equity series, normally EQ"),
 ):
-    """Return daily historical OHLCV/turnover data for an NSE equity."""
+    """
+    Return validated daily historical OHLCV/turnover/delivery data.
+
+    Primary: NSE historical equity endpoint.
+    Fallback: NSE free daily Full Bhavcopy + Security Deliverable archive.
+    HTML/error fragments are never accepted as market observations.
+    """
     try:
-        return _get_historical_equity(symbol, from_date, to_date, series)
+        return _get_historical_equity(
+            symbol, from_date, to_date, series
+        )
     except Exception as e:
         raise HTTPException(
             status_code=502,
-            detail=f"NSE historical equity data unavailable for '{symbol}'. Underlying error: {str(e)}",
+            detail=(
+                f"NSE historical equity data unavailable for "
+                f"'{symbol}'. Underlying error: {str(e)}"
+            ),
         )
 
 
@@ -1614,60 +2093,102 @@ def nse_historical_summary(
     to_date: str | None = Query(None, description="Optional end date"),
     series: str = Query("EQ", description="NSE equity series"),
 ):
-    """Return historical data plus research-ready return, volatility and liquidity statistics."""
+    """Return validated historical data plus research-ready statistics."""
     try:
-        result = _get_historical_equity(symbol, from_date, to_date, series)
+        result = _get_historical_equity(
+            symbol, from_date, to_date, series
+        )
         rows = result.get("data", [])
 
         def num(row, *keys):
             for key in keys:
                 value = row.get(key) if isinstance(row, dict) else None
-                try:
-                    if value is not None and str(value).strip() != "":
-                        return float(str(value).replace(",", ""))
-                except (TypeError, ValueError):
-                    pass
+                parsed = _to_float(value)
+                if parsed is not None:
+                    return parsed
             return None
 
         closes = []
         volumes = []
         values = []
         trades = []
+        deliveries = []
+
         for row in rows:
-            close = num(row, "CH_CLOSING_PRICE", "close", "CLOSE")
-            if close is not None:
+            close = num(
+                row, "CH_CLOSING_PRICE", "CLOSE_PRICE", "close", "CLOSE"
+            )
+            if close is not None and close > 0:
                 closes.append(close)
-            volume = num(row, "CH_TOT_TRADED_QTY", "volume", "VOLUME")
+
+            volume = num(
+                row, "CH_TOT_TRADED_QTY", "TTL_TRD_QNTY",
+                "volume", "VOLUME"
+            )
             if volume is not None:
                 volumes.append(volume)
-            value = num(row, "CH_TOT_TRADED_VAL", "value", "VALUE")
+
+            value = num(
+                row, "CH_TOT_TRADED_VAL", "TURNOVER",
+                "TURNOVER_LACS", "value", "VALUE"
+            )
             if value is not None:
+                if (
+                    "TURNOVER_LACS" in row
+                    and "CH_TOT_TRADED_VAL" not in row
+                    and "TURNOVER" not in row
+                ):
+                    value *= 100000
                 values.append(value)
-            trade_count = num(row, "CH_TOTAL_TRADES", "No of trades", "NO OF TRADES")
+
+            trade_count = num(
+                row, "CH_TOTAL_TRADES", "NO_OF_TRADES",
+                "No of trades", "NO OF TRADES"
+            )
             if trade_count is not None:
                 trades.append(trade_count)
+
+            delivery_pct = num(
+                row, "CH_DELIV_PER", "DELIV_PER",
+                "deliveryPercent", "DELIVERY_PERCENT"
+            )
+            if delivery_pct is not None and 0 <= delivery_pct <= 100:
+                deliveries.append(delivery_pct)
 
         returns = []
         for i in range(1, len(closes)):
             if closes[i - 1]:
-                returns.append((closes[i] / closes[i - 1] - 1.0) * 100.0)
+                returns.append(
+                    (closes[i] / closes[i - 1] - 1.0) * 100.0
+                )
 
         period_return = None
         if len(closes) >= 2 and closes[0]:
-            period_return = (closes[-1] / closes[0] - 1.0) * 100.0
+            period_return = (
+                (closes[-1] / closes[0] - 1.0) * 100.0
+            )
 
         annualized_vol = None
         if len(returns) >= 2:
             mean = sum(returns) / len(returns)
-            variance = sum((x - mean) ** 2 for x in returns) / (len(returns) - 1)
+            variance = (
+                sum((x - mean) ** 2 for x in returns)
+                / (len(returns) - 1)
+            )
             annualized_vol = (variance ** 0.5) * (252 ** 0.5)
 
         running_high = None
         max_drawdown = 0.0
         for close in closes:
-            running_high = close if running_high is None else max(running_high, close)
+            running_high = (
+                close if running_high is None
+                else max(running_high, close)
+            )
             if running_high:
-                max_drawdown = min(max_drawdown, (close / running_high - 1.0) * 100.0)
+                max_drawdown = min(
+                    max_drawdown,
+                    (close / running_high - 1.0) * 100.0,
+                )
 
         return {
             **result,
@@ -1677,15 +2198,31 @@ def nse_historical_summary(
                 "max_drawdown_pct": max_drawdown,
                 "period_high": max(closes) if closes else None,
                 "period_low": min(closes) if closes else None,
-                "avg_daily_volume": (sum(volumes) / len(volumes)) if volumes else None,
-                "avg_daily_traded_value": (sum(values) / len(values)) if values else None,
-                "avg_daily_trades": (sum(trades) / len(trades)) if trades else None,
+                "avg_daily_volume": (
+                    sum(volumes) / len(volumes) if volumes else None
+                ),
+                "avg_daily_traded_value": (
+                    sum(values) / len(values) if values else None
+                ),
+                "avg_daily_trades": (
+                    sum(trades) / len(trades) if trades else None
+                ),
+                "avg_delivery_pct": (
+                    sum(deliveries) / len(deliveries)
+                    if deliveries else None
+                ),
+                "valid_close_observations": len(closes),
+                "valid_volume_observations": len(volumes),
+                "valid_delivery_observations": len(deliveries),
             },
         }
     except Exception as e:
         raise HTTPException(
             status_code=502,
-            detail=f"NSE historical summary unavailable for '{symbol}'. Underlying error: {str(e)}",
+            detail=(
+                f"NSE historical summary unavailable for "
+                f"'{symbol}'. Underlying error: {str(e)}"
+            ),
         )
 
 
