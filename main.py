@@ -4,17 +4,34 @@ import json
 import time
 import requests
 from urllib.parse import quote
+from threading import Lock
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from nsedata import nse
 
 NSE_BASE = "https://www.nseindia.com"
 _nse_session = None
 
+# ---------------------------------------------------------
+# Master-universe cache
+# ---------------------------------------------------------
+# The master universe is built from the NSE daily equity bhavcopy.
+# Index memberships are fetched only when explicitly requested, because
+# NSE's per-symbol getIndexList endpoint can require hundreds/thousands
+# of requests for a full market universe.
+_MASTER_CACHE = {}
+_MASTER_CACHE_LOCK = Lock()
+_MEMBERSHIP_CACHE = {}
+_MEMBERSHIP_CACHE_LOCK = Lock()
+
+MASTER_MEMBERSHIP_WORKERS = 6
+MASTER_MEMBERSHIP_MAX_SYMBOLS = 600
+
 
 app = FastAPI(
     title="Indian Equity Research API",
     description="Free NSE/BSE research data gateway",
-    version="0.2.0"
+    version="0.3.0"
 )
 
 
@@ -141,6 +158,298 @@ def nse_api_get(path, params=None):
     response.raise_for_status()
 
     return response.json()
+
+
+
+# ---------------------------------------------------------
+# Master NSE equity universe helpers
+# ---------------------------------------------------------
+def _normalize_symbol(value):
+    """Normalize an NSE symbol to a clean uppercase string."""
+    if value is None:
+        return None
+
+    value = str(value).strip().upper()
+
+    if not value or value in {"NAN", "NONE", "NULL"}:
+        return None
+
+    return value
+
+
+def _extract_equity_symbols(df):
+    """
+    Extract a de-duplicated equity symbol universe from the NSE
+    securities bhavcopy while preserving the source order.
+    """
+    if df is None:
+        return []
+
+    if hasattr(df, "columns"):
+        # nse-archives column names can vary by release/version.
+        candidates = [
+            "symbol",
+            "Symbol",
+            "SYMBOL",
+            "Symbol ",
+            "SYMBOL "
+        ]
+
+        column = next(
+            (c for c in candidates if c in df.columns),
+            None
+        )
+
+        if column is not None:
+            values = df[column].tolist()
+        else:
+            # Last-resort case-insensitive lookup.
+            column = next(
+                (
+                    c for c in df.columns
+                    if str(c).strip().lower() == "symbol"
+                ),
+                None
+            )
+            values = df[column].tolist() if column else []
+    else:
+        values = []
+
+    symbols = []
+    seen = set()
+
+    for value in values:
+        symbol = _normalize_symbol(value)
+
+        if symbol and symbol not in seen:
+            seen.add(symbol)
+            symbols.append(symbol)
+
+    return symbols
+
+
+def _get_stock_index_membership_cached(symbol):
+    """
+    Fetch one stock's index membership through NSE's current
+    getIndexList API, with an in-process cache.
+    """
+    symbol_name = _normalize_symbol(symbol)
+
+    if not symbol_name:
+        return {
+            "symbol": symbol_name,
+            "count": 0,
+            "indices": [],
+            "error": "Invalid symbol"
+        }
+
+    with _MEMBERSHIP_CACHE_LOCK:
+        if symbol_name in _MEMBERSHIP_CACHE:
+            return _MEMBERSHIP_CACHE[symbol_name]
+
+    try:
+        payload = nse_api_get(
+            "/api/NextApi/apiClient/GetQuoteApi",
+            params={
+                "functionName": "getIndexList",
+                "symbol": symbol_name
+            }
+        )
+
+        if isinstance(payload, dict):
+            data = payload.get("data", [])
+
+            if not data:
+                for key in ("indexList", "indices", "equityResponse"):
+                    if isinstance(payload.get(key), list):
+                        data = payload.get(key)
+                        break
+        else:
+            data = payload
+
+        if data is None:
+            data = []
+
+        if not isinstance(data, list):
+            data = [data]
+
+        result = {
+            "symbol": symbol_name,
+            "count": len(data),
+            "indices": data
+        }
+
+        with _MEMBERSHIP_CACHE_LOCK:
+            _MEMBERSHIP_CACHE[symbol_name] = result
+
+        return result
+
+    except Exception as e:
+        return {
+            "symbol": symbol_name,
+            "count": 0,
+            "indices": [],
+            "error": str(e)
+        }
+
+
+def _build_master_universe(date, include_membership=False, max_symbols=None):
+    """
+    Build the broad NSE equity universe from the daily securities
+    bhavcopy.
+
+    By default this returns the full symbol universe without making a
+    request for every stock's index membership. Set include_membership
+    to true to enrich the first N symbols with getIndexList data.
+    """
+    cache_key = (
+        date,
+        bool(include_membership),
+        int(max_symbols) if max_symbols is not None else None
+    )
+
+    with _MASTER_CACHE_LOCK:
+        if cache_key in _MASTER_CACHE:
+            return _MASTER_CACHE[cache_key]
+
+    df = nse.get(
+        "capital_market",
+        "equities_sme",
+        "sec_bhavdata_full",
+        date
+    )
+
+    symbols = _extract_equity_symbols(df)
+
+    result = {
+        "source": "NSE",
+        "date": date,
+        "dataset": "sec_bhavdata_full",
+        "count": len(symbols),
+        "symbols": symbols,
+        "membership_included": bool(include_membership)
+    }
+
+    if include_membership:
+        limit = max_symbols if max_symbols is not None else MASTER_MEMBERSHIP_MAX_SYMBOLS
+        limit = max(1, min(int(limit), len(symbols)))
+
+        selected = symbols[:limit]
+        membership = {}
+
+        # A small worker pool avoids the extremely high request volume
+        # that would occur if all symbols were requested at once.
+        with ThreadPoolExecutor(
+            max_workers=MASTER_MEMBERSHIP_WORKERS
+        ) as executor:
+            futures = {
+                executor.submit(
+                    _get_stock_index_membership_cached,
+                    symbol
+                ): symbol
+                for symbol in selected
+            }
+
+            for future in as_completed(futures):
+                symbol = futures[future]
+
+                try:
+                    membership[symbol] = future.result()
+                except Exception as e:
+                    membership[symbol] = {
+                        "symbol": symbol,
+                        "count": 0,
+                        "indices": [],
+                        "error": str(e)
+                    }
+
+        # Preserve universe order rather than completion order.
+        result["membership_limit"] = limit
+        result["membership_count"] = len(membership)
+        result["stocks"] = [
+            {
+                "symbol": symbol,
+                "indices": membership.get(
+                    symbol,
+                    {
+                        "symbol": symbol,
+                        "count": 0,
+                        "indices": []
+                    }
+                ).get("indices", []),
+                "index_count": membership.get(
+                    symbol,
+                    {
+                        "symbol": symbol,
+                        "count": 0,
+                        "indices": []
+                    }
+                ).get("count", 0),
+                **(
+                    {
+                        "membership_error": membership[symbol]["error"]
+                    }
+                    if membership.get(symbol, {}).get("error")
+                    else {}
+                )
+            }
+            for symbol in selected
+        ]
+
+    with _MASTER_CACHE_LOCK:
+        _MASTER_CACHE[cache_key] = result
+
+    return result
+
+
+
+@app.get("/nse/master-universe")
+def nse_master_universe(
+    date: str = Query(
+        ...,
+        description="Trading date in YYYY-MM-DD format"
+    ),
+    include_membership: bool = Query(
+        False,
+        description=(
+            "Also fetch stock-to-index membership. "
+            "This is slower because it uses NSE's per-symbol getIndexList API."
+        )
+    ),
+    max_symbols: int = Query(
+        MASTER_MEMBERSHIP_MAX_SYMBOLS,
+        ge=1,
+        le=2000,
+        description=(
+            "Maximum number of symbols to enrich when "
+            "include_membership=true."
+        )
+    )
+):
+    """
+    Return the broad NSE equity discovery universe for a trading date.
+
+    Default mode is fast and returns the de-duplicated equity symbol
+    universe from the NSE daily securities bhavcopy.
+
+    Optional membership mode enriches up to max_symbols with each
+    stock's current NSE index memberships.
+    """
+    try:
+        return _build_master_universe(
+            date=date,
+            include_membership=include_membership,
+            max_symbols=max_symbols
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"NSE master-universe data unavailable for {date}. "
+                f"Underlying error: {str(e)}"
+            )
+        )
 
 
 @app.get("/nse/index-list")
@@ -345,8 +654,8 @@ def root():
     return {
         "service": "Indian Equity Research API",
         "status": "online",
-        "version": "0.2.0",
-        "data_layers": ["NSE"],
+        "version": "0.3.0",
+        "data_layers": ["NSE", "master-universe", "index-membership"],
     }
 
 
