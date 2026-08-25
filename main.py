@@ -256,34 +256,47 @@ def _get_equity_quote_cached(symbol, section=None):
     except Exception as e:
         errors.append(f"quote-equity: {str(e)}")
 
-    # Fallback for the normal quote request. NSE's NextApi getSymbolData
-    # exposes a rich single-symbol response.
-    if section_name is None:
-        try:
-            payload = nse_api_get(
-                "/api/NextApi/apiClient/GetQuoteApi",
-                params={
-                    "functionName": "getSymbolData",
-                    "marketType": "N",
-                    "series": "EQ",
-                    "symbol": symbol_name,
-                }
-            )
-            result = {
-                "source": "NSE",
-                "symbol": symbol_name,
-                "endpoint": "/api/NextApi/apiClient/GetQuoteApi",
+    # NSE may return 403 for /api/quote-equity, especially for
+    # section=trade_info. The NextApi getSymbolData endpoint is a
+    # richer fallback and already contains tradeInfo, priceInfo,
+    # securityInfo, metaData and indexList in the equityResponse.
+    # Therefore use it for BOTH normal quote and trade_info requests.
+    try:
+        payload = nse_api_get(
+            "/api/NextApi/apiClient/GetQuoteApi",
+            params={
                 "functionName": "getSymbolData",
-                "section": None,
-                "fallback": True,
-                "data": payload,
-                "errors": errors,
+                "marketType": "N",
+                "series": "EQ",
+                "symbol": symbol_name,
             }
-            with _QUOTE_CACHE_LOCK:
-                _QUOTE_CACHE[cache_key] = result
-            return result
-        except Exception as e:
-            errors.append(f"getSymbolData fallback: {str(e)}")
+        )
+
+        result = {
+            "source": "NSE",
+            "symbol": symbol_name,
+            "endpoint": "/api/NextApi/apiClient/GetQuoteApi",
+            "functionName": "getSymbolData",
+            "section": section_name,
+            "fallback": True,
+            "data": payload,
+            "errors": errors,
+        }
+
+        if section_name == "trade_info":
+            equity_response = payload.get("equityResponse", []) if isinstance(payload, dict) else []
+            if equity_response and isinstance(equity_response[0], dict):
+                row = equity_response[0]
+                result["trade_info"] = row.get("tradeInfo", {})
+                result["security_info"] = row.get("securityInfo", {})
+                result["price_info"] = row.get("priceInfo", {})
+                result["meta_data"] = row.get("metaData", {})
+
+        with _QUOTE_CACHE_LOCK:
+            _QUOTE_CACHE[cache_key] = result
+        return result
+    except Exception as e:
+        errors.append(f"getSymbolData fallback: {str(e)}")
 
     raise RuntimeError(
         f"NSE equity quote unavailable for '{symbol_name}'. "
