@@ -1723,11 +1723,25 @@ def _get_nse_full_bhavcopy_for_date(session, trading_date, symbol):
                 "date": trading_date.isoformat(),
             }
 
+        # NSE's legacy/full-bhavcopy CSV can contain whitespace/BOM in
+        # column names (for example ``SYMBOL `` / `` CLOSE_PRICE``).
+        # Normalize the header before looking up fields; otherwise a real
+        # NETWEB/RELIANCE row can be incorrectly classified as invalid_row.
         reader = csv.DictReader(io.StringIO(content))
         target = _normalize_symbol(symbol)
         wanted = None
 
-        for row in reader:
+        for raw_row in reader:
+            if not isinstance(raw_row, dict):
+                continue
+
+            row = {}
+            for key, value in raw_row.items():
+                normalized_key = _clean_text(key).upper()
+                normalized_key = normalized_key.replace("\ufeff", "")
+                if normalized_key:
+                    row[normalized_key] = _clean_text(value)
+
             if _historical_row_symbol(row) == target:
                 wanted = row
                 break
@@ -1747,6 +1761,8 @@ def _get_nse_full_bhavcopy_for_date(session, trading_date, symbol):
             return {
                 "status": "invalid_row",
                 "date": trading_date.isoformat(),
+                "error": "Target symbol row found but no positive CLOSE_PRICE/CLOSE field was available after header normalization.",
+                "columns": sorted(row.keys())[:80],
             }
 
         turnover_lacs = _to_float(wanted.get("TURNOVER_LACS"))
@@ -1864,6 +1880,7 @@ def _get_historical_equity_bhavcopy_fallback(
                     "date": current.isoformat(),
                     "status": status,
                     "error": result.get("error"),
+                    **({"columns": result.get("columns")} if result.get("columns") else {}),
                 })
 
             # Conservative archive rate to reduce NSE throttling risk.
