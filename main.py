@@ -33,18 +33,14 @@ def dataframe_to_records(df):
 # ---------------------------------------------------------
 # NSE live API session
 # ---------------------------------------------------------
-
-NSE_BASE = "https://www.nseindia.com"
-
-_nse_session = None
-
-
 def get_nse_session():
     """
-    Create a warmed-up NSE browser-like session.
-    NSE may reject requests that do not first establish
-    a normal website session.
+    Create and warm an NSE browser-like session.
+
+    NSE's live web endpoints use bot protection and may require
+    cookies obtained from normal website navigation before API calls.
     """
+
     global _nse_session
 
     if _nse_session is not None:
@@ -56,23 +52,53 @@ def get_nse_session():
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/151.0.0.0 Safari/537.36"
+            "Chrome/146.0.0.0 Safari/537.36"
         ),
-        "Accept": (
-            "application/json,text/plain,*/*"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.nseindia.com/",
+        "Accept-Language": "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate",
         "Connection": "keep-alive",
+        "DNT": "1",
+        "Upgrade-Insecure-Requests": "1",
     })
 
-    # Warm the NSE session before calling the API.
-    response = session.get(
+    # Step 1: establish the main NSE browser session.
+    session.get(
         NSE_BASE + "/",
-        timeout=20
+        headers={
+            "Accept": (
+                "text/html,application/xhtml+xml,"
+                "application/xml;q=0.9,image/avif,"
+                "image/webp,*/*;q=0.8"
+            ),
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+        },
+        timeout=20,
     )
 
-    response.raise_for_status()
+    time.sleep(1)
+
+    # Step 2: visit the live equity page.
+    # Current NSE implementations use this page to establish
+    # additional session state/cookies before API requests.
+    session.get(
+        NSE_BASE + "/market-data/live-equity-market",
+        headers={
+            "Accept": (
+                "text/html,application/xhtml+xml,"
+                "application/xml;q=0.9,image/avif,"
+                "image/webp,*/*;q=0.8"
+            ),
+            "Referer": NSE_BASE + "/",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-User": "?1",
+        },
+        timeout=20,
+    )
 
     time.sleep(1)
 
@@ -83,23 +109,35 @@ def get_nse_session():
 
 def nse_api_get(path, params=None):
     """
-    GET an NSE JSON API endpoint using a warmed session.
+    Request an NSE live JSON endpoint using the warmed session.
     """
+
     session = get_nse_session()
 
     response = session.get(
         NSE_BASE + path,
         params=params,
-        timeout=30
+        headers={
+            "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding": "gzip, deflate",
+            "Referer": NSE_BASE + "/market-data/live-equity-market",
+            "X-Requested-With": "XMLHttpRequest",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/146.0.0.0 Safari/537.36"
+            ),
+        },
+        timeout=30,
     )
 
     response.raise_for_status()
 
     return response.json()
-
-# ---------------------------------------------------------
-# NSE INDEX DISCOVERY
-# ---------------------------------------------------------
 
 @app.get("/nse/index-list")
 def nse_index_list():
