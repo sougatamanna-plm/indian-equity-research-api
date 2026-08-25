@@ -49,7 +49,7 @@ INDEX_CONSTITUENT_WORKERS = 4
 app = FastAPI(
     title="Indian Equity Research API",
     description="Free NSE/BSE research data gateway",
-    version="0.6.2"
+    version="0.6.3"
 )
 
 
@@ -1358,6 +1358,9 @@ _BOARD_MEETINGS_CACHE_LOCK = Lock()
 _FINANCIAL_RESULTS_CACHE = {}
 _FINANCIAL_RESULTS_CACHE_LOCK = Lock()
 
+_NSE_TRADING_HOLIDAYS_CACHE = None
+_NSE_TRADING_HOLIDAYS_CACHE_LOCK = Lock()
+
 
 # ---------------------------------------------------------
 # Generic helpers for NSE filing / historical endpoints
@@ -1460,17 +1463,46 @@ def _parse_row_date(value):
     return None
 
 
-def _historical_row_date(row):
+def _historical_row_date_candidates(row):
+    """
+    Return all parseable date fields carried by a historical row.
+
+    DATE1 is the exchange bhavcopy trade date. CH_TIMESTAMP is retained by
+    NSE's historical JSON shape. If both exist they must agree.
+    """
     if not isinstance(row, dict):
+        return {}
+
+    keys = (
+        "DATE1", "date", "Date", "DATE", "TRADE_DATE", "TRADING_DATE",
+        "CH_TIMESTAMP", "mTIMESTAMP", "TIMESTAMP",
+    )
+    candidates = {}
+    for key in keys:
+        if key in row:
+            parsed = _parse_row_date(row.get(key))
+            if parsed:
+                candidates[key] = parsed
+    return candidates
+
+
+def _historical_row_date(row):
+    candidates = _historical_row_date_candidates(row)
+    if not candidates:
         return None
-    for key in (
-        "CH_TIMESTAMP", "mTIMESTAMP", "TIMESTAMP", "DATE1", "date",
-        "Date", "DATE", "TRADE_DATE", "TRADING_DATE",
-    ):
-        parsed = _parse_row_date(row.get(key))
-        if parsed:
-            return parsed
-    return None
+
+    # Prefer DATE1/trade-date fields when present; otherwise use the NSE
+    # timestamp field. This prevents a shifted timestamp from silently
+    # changing the observation's trading date.
+    for key in ("DATE1", "date", "Date", "DATE", "TRADE_DATE", "TRADING_DATE"):
+        if key in candidates:
+            return candidates[key]
+    return next(iter(candidates.values()))
+
+
+def _historical_row_date_consistent(row):
+    candidates = _historical_row_date_candidates(row)
+    return len(set(candidates.values())) <= 1
 
 
 def _historical_row_close(row):
@@ -1496,13 +1528,88 @@ def _historical_row_symbol(row):
     return None
 
 
+def _historical_row_num(row, *keys):
+    if not isinstance(row, dict):
+        return None
+    for key in keys:
+        value = _to_float(row.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _historical_row_quality_issues(row):
+    """
+    Validate internal OHLCV/delivery relationships without requiring every
+    optional field to exist in every NSE response format.
+    """
+    issues = []
+
+    open_price = _historical_row_num(
+        row, "CH_OPENING_PRICE", "OPEN_PRICE", "OPEN", "open"
+    )
+    high = _historical_row_num(
+        row, "CH_TRADE_HIGH_PRICE", "HIGH_PRICE", "HIGH", "high"
+    )
+    low = _historical_row_num(
+        row, "CH_TRADE_LOW_PRICE", "LOW_PRICE", "LOW", "low"
+    )
+    close = _historical_row_close(row)
+    volume = _historical_row_num(
+        row, "CH_TOT_TRADED_QTY", "TTL_TRD_QNTY", "VOLUME", "volume"
+    )
+    delivery_qty = _historical_row_num(
+        row, "CH_DELIV_QTY", "DELIV_QTY", "deliveryQuantity"
+    )
+    delivery_pct = _historical_row_num(
+        row, "CH_DELIV_PER", "DELIV_PER", "deliveryPercent", "DELIVERY_PERCENT"
+    )
+    turnover = _historical_row_num(
+        row, "CH_TOT_TRADED_VAL", "TURNOVER", "TURNOVER_LACS", "VALUE", "value"
+    )
+
+    for label, value in (
+        ("open", open_price), ("high", high), ("low", low), ("close", close)
+    ):
+        if value is not None and value <= 0:
+            issues.append(f"{label}_not_positive")
+
+    if high is not None and low is not None and high < low:
+        issues.append("high_below_low")
+
+    if close is not None and high is not None and close > high + 1e-9:
+        issues.append("close_above_high")
+
+    if close is not None and low is not None and close < low - 1e-9:
+        issues.append("close_below_low")
+
+    if volume is not None and volume < 0:
+        issues.append("negative_volume")
+
+    if delivery_qty is not None and delivery_qty < 0:
+        issues.append("negative_delivery_quantity")
+
+    if volume is not None and delivery_qty is not None and delivery_qty > volume + 1e-9:
+        issues.append("delivery_quantity_above_volume")
+
+    if delivery_pct is not None and not 0 <= delivery_pct <= 100:
+        issues.append("delivery_percent_out_of_range")
+
+    if turnover is not None and turnover < 0:
+        issues.append("negative_turnover")
+
+    return issues
+
+
 def _is_valid_historical_row(row, expected_symbol=None, start=None, end=None):
     """
     Reject HTML/error fragments and malformed records.
 
-    A historical observation must contain a recognizable date and positive
-    close. If the source supplies a symbol, it must match the requested
-    symbol. The date must fall inside the requested window.
+    A historical observation must contain a recognizable trade date and
+    positive close. If multiple date fields exist they must agree. If the
+    source supplies a symbol, it must match the requested symbol. The date
+    must fall inside the requested window and OHLCV relationships must be
+    internally coherent.
     """
     if not isinstance(row, dict) or not row:
         return False
@@ -1529,6 +1636,9 @@ def _is_valid_historical_row(row, expected_symbol=None, start=None, end=None):
     if row_date is None or close is None:
         return False
 
+    if not _historical_row_date_consistent(row):
+        return False
+
     if start and row_date < start.date():
         return False
     if end and row_date > end.date():
@@ -1538,10 +1648,20 @@ def _is_valid_historical_row(row, expected_symbol=None, start=None, end=None):
     if expected_symbol and row_symbol and row_symbol != expected_symbol:
         return False
 
+    if _historical_row_quality_issues(row):
+        return False
+
     return True
 
 
 def _validate_historical_rows(rows, expected_symbol=None, start=None, end=None):
+    """
+    Row-level validation only.
+
+    IMPORTANT: do not deduplicate here. Dataset-level validation needs to see
+    duplicate dates so that a broken source cannot hide them by overwriting
+    one observation with another.
+    """
     valid = []
     invalid = 0
 
@@ -1556,15 +1676,241 @@ def _validate_historical_rows(rows, expected_symbol=None, start=None, end=None):
         else:
             invalid += 1
 
-    dedup = {}
-    for row in valid:
+    valid.sort(key=lambda row: _historical_row_date(row).isoformat())
+    return valid, invalid
+
+
+def _get_nse_trading_holiday_dates():
+    """
+    Fetch NSE's official trading-holiday calendar.
+
+    NSE exposes the trading holiday master through /api/holiday-master.
+    CM is preferred for cash equities; FO is retained as a compatibility
+    fallback because NSE's holiday response is segment-oriented.
+    """
+    global _NSE_TRADING_HOLIDAYS_CACHE
+
+    with _NSE_TRADING_HOLIDAYS_CACHE_LOCK:
+        if _NSE_TRADING_HOLIDAYS_CACHE is not None:
+            return _NSE_TRADING_HOLIDAYS_CACHE
+
+    try:
+        payload = nse_api_get("/api/holiday-master", params={"type": "trading"})
+        holiday_dates = set()
+
+        if isinstance(payload, dict):
+            segments = []
+            for segment in ("CM", "FO"):
+                value = payload.get(segment)
+                if isinstance(value, list):
+                    segments.extend(value)
+
+            # Be tolerant of future NSE response-shape changes.
+            if not segments:
+                for value in payload.values():
+                    if isinstance(value, list):
+                        segments.extend(value)
+
+            for record in segments:
+                if not isinstance(record, dict):
+                    continue
+                for key in (
+                    "tradingDate", "trading_date", "date", "DATE",
+                    "holidayDate", "holiday_date",
+                ):
+                    parsed = _parse_row_date(record.get(key))
+                    if parsed:
+                        holiday_dates.add(parsed)
+                        break
+
+        result = {
+            "dates": holiday_dates,
+            "source": "NSE_holiday_master",
+            "error": None,
+        }
+    except Exception as exc:
+        # Do not make the historical endpoint unusable merely because the
+        # holiday API is temporarily blocked. The caller will fall back to
+        # weekday logic and explicitly report that limitation.
+        result = {
+            "dates": set(),
+            "source": "weekday_fallback",
+            "error": str(exc),
+        }
+
+    with _NSE_TRADING_HOLIDAYS_CACHE_LOCK:
+        _NSE_TRADING_HOLIDAYS_CACHE = result
+
+    return result
+
+
+def _historical_expected_trading_dates(start, end):
+    """
+    Return weekday dates excluding NSE's official trading holidays.
+
+    If the holiday master cannot be retrieved, weekdays are used as a
+    conservative fallback and the caller reports the holiday-data error.
+    """
+    if start is None or end is None:
+        return set(), {"source": "unavailable", "error": "missing date range"}
+
+    holiday_info = _get_nse_trading_holiday_dates()
+    holidays = holiday_info.get("dates", set())
+
+    current = start.date()
+    finish = end.date()
+    dates = set()
+
+    while current <= finish:
+        if current.weekday() < 5 and current not in holidays:
+            dates.add(current)
+        current += timedelta(days=1)
+
+    return dates, {
+        "source": holiday_info.get("source"),
+        "error": holiday_info.get("error"),
+        "holiday_count_in_range": sum(
+            1
+            for day in holidays
+            if start.date() <= day <= finish
+        ),
+    }
+
+
+def _historical_integrity_report(
+    rows, expected_symbol=None, start=None, end=None
+):
+    """
+    Dataset-level validation that cannot be performed safely on a single row.
+
+    Detects:
+      - duplicate trade dates
+      - inconsistent DATE1/CH_TIMESTAMP dates
+      - weekend/holiday observations
+      - unexpected out-of-range dates
+      - missing expected trading dates
+      - OHLCV relationship problems
+    """
+    if not isinstance(rows, list):
+        rows = []
+
+    date_counts = {}
+    invalid_row_count = 0
+    inconsistent_date_count = 0
+    quality_issue_count = 0
+    quality_issue_examples = []
+
+    for row in rows:
+        if not _is_valid_historical_row(
+            row, expected_symbol=expected_symbol, start=start, end=end
+        ):
+            invalid_row_count += 1
+
         row_date = _historical_row_date(row)
         if row_date:
-            dedup[row_date.isoformat()] = row
+            key = row_date.isoformat()
+            date_counts[key] = date_counts.get(key, 0) + 1
 
-    result = list(dedup.values())
-    result.sort(key=lambda row: _historical_row_date(row).isoformat())
-    return result, invalid
+        if not _historical_row_date_consistent(row):
+            inconsistent_date_count += 1
+
+        issues = _historical_row_quality_issues(row)
+        if issues:
+            quality_issue_count += 1
+            if len(quality_issue_examples) < 20:
+                quality_issue_examples.append({
+                    "date": row_date.isoformat() if row_date else None,
+                    "issues": issues,
+                })
+
+    observed_dates = set()
+    for key in date_counts:
+        try:
+            observed_dates.add(datetime.strptime(key, "%Y-%m-%d").date())
+        except ValueError:
+            pass
+
+    duplicate_dates = sorted(
+        key for key, count in date_counts.items() if count > 1
+    )
+
+    expected_dates, expected_meta = _historical_expected_trading_dates(start, end)
+
+    unexpected_dates = sorted(
+        day.isoformat()
+        for day in observed_dates
+        if day not in expected_dates
+    )
+    missing_dates = sorted(
+        day.isoformat()
+        for day in expected_dates
+        if day not in observed_dates
+    )
+
+    weekend_dates = sorted(
+        day.isoformat()
+        for day in observed_dates
+        if day.weekday() >= 5
+    )
+
+    holiday_dates = sorted(
+        day.isoformat()
+        for day in observed_dates
+        if day in _get_nse_trading_holiday_dates().get("dates", set())
+    )
+
+    integrity_ok = (
+        len(duplicate_dates) == 0
+        and inconsistent_date_count == 0
+        and invalid_row_count == 0
+        and quality_issue_count == 0
+        and len(weekend_dates) == 0
+        and len(holiday_dates) == 0
+        and len(unexpected_dates) == 0
+    )
+
+    expected_count = len(expected_dates)
+
+    return {
+        "date_integrity": "VALID" if integrity_ok else "INVALID",
+        "raw_row_count": len(rows),
+        "unique_date_count": len(observed_dates),
+        "duplicate_date_count": len(duplicate_dates),
+        "duplicate_dates": duplicate_dates[:50],
+        "inconsistent_date_count": inconsistent_date_count,
+        "invalid_row_count": invalid_row_count,
+        "quality_issue_count": quality_issue_count,
+        "quality_issue_examples": quality_issue_examples,
+        "weekend_date_count": len(weekend_dates),
+        "weekend_dates": weekend_dates[:50],
+        "holiday_date_count": len(holiday_dates),
+        "holiday_dates": holiday_dates[:50],
+        "expected_trading_days": expected_count,
+        "missing_expected_dates_count": len(missing_dates),
+        "missing_expected_dates": missing_dates[:50],
+        "unexpected_date_count": len(unexpected_dates),
+        "unexpected_dates": unexpected_dates[:50],
+        "coverage_pct": (
+            (len(observed_dates) / expected_count) * 100.0
+            if expected_count else None
+        ),
+        "holiday_calendar_source": expected_meta.get("source"),
+        "holiday_calendar_error": expected_meta.get("error"),
+        "holiday_count_in_range": expected_meta.get("holiday_count_in_range", 0),
+    }
+
+
+def _historical_expected_weekdays(start, end):
+    if start is None or end is None:
+        return None
+    current = start.date()
+    finish = end.date()
+    count = 0
+    while current <= finish:
+        if current.weekday() < 5:
+            count += 1
+        current += timedelta(days=1)
+    return count
 
 
 def _historical_expected_weekdays(start, end):
@@ -1835,8 +2181,11 @@ def _get_historical_equity_bhavcopy_fallback(
 ):
     """
     Build validated history from NSE's free daily Full Bhavcopy +
-    Security Deliverable archive. Weekends are skipped; unavailable
-    dates are recorded instead of becoming fake observations.
+    Security Deliverable archive.
+
+    Weekends and official NSE trading holidays are skipped. Dataset-level
+    validation is retained in the response so a successful HTTP request
+    cannot be mistaken for a clean market-data dataset.
     """
     target = _normalize_symbol(symbol)
     if not target:
@@ -1848,11 +2197,13 @@ def _get_historical_equity_bhavcopy_fallback(
     unavailable_dates = []
     invalid_dates = []
 
+    expected_dates, holiday_meta = _historical_expected_trading_dates(start, end)
+
     current = start.date()
     finish = end.date()
 
     while current <= finish:
-        if current.weekday() < 5:
+        if current in expected_dates:
             result = _get_nse_full_bhavcopy_for_date(
                 session=session,
                 trading_date=current,
@@ -1880,13 +2231,24 @@ def _get_historical_equity_bhavcopy_fallback(
                     "date": current.isoformat(),
                     "status": status,
                     "error": result.get("error"),
-                    **({"columns": result.get("columns")} if result.get("columns") else {}),
+                    **(
+                        {"columns": result.get("columns")}
+                        if result.get("columns") else {}
+                    ),
                 })
 
             # Conservative archive rate to reduce NSE throttling risk.
             time.sleep(0.20)
 
         current += timedelta(days=1)
+
+    # Do not silently overwrite duplicates before the integrity report.
+    integrity = _historical_integrity_report(
+        rows,
+        expected_symbol=target,
+        start=start,
+        end=end,
+    )
 
     dedup = {}
     for row in rows:
@@ -1897,24 +2259,40 @@ def _get_historical_equity_bhavcopy_fallback(
     rows = list(dedup.values())
     rows.sort(key=lambda row: _historical_row_date(row).isoformat())
 
+    expected_trading_days = len(expected_dates)
+    observed = len(rows)
+
     return {
         "source": "NSE_Bhavcopy_Fallback",
         "symbol": target,
         "series": str(series or "EQ").strip().upper(),
         "from_date": _format_nse_date(start),
         "to_date": _format_nse_date(end),
-        "count": len(rows),
+        "count": observed,
         "data": rows,
         "fallback_used": True,
-        "data_quality": "VALID" if rows else "UNAVAILABLE",
+        "data_quality": (
+            "VALID"
+            if observed and integrity.get("date_integrity") == "VALID"
+            else ("UNAVAILABLE" if not observed else "INVALID")
+        ),
         "expected_weekdays": _historical_expected_weekdays(start, end),
-        "valid_observations": len(rows),
+        "expected_trading_days": expected_trading_days,
+        "valid_observations": observed,
         "unavailable_dates_count": len(unavailable_dates),
         "invalid_dates_count": len(invalid_dates),
         "fallback_error_count": len(errors),
         "unavailable_dates": unavailable_dates[:50],
         "invalid_dates": invalid_dates[:50],
         "fallback_errors": errors[:50],
+        "holiday_calendar_source": holiday_meta.get("source"),
+        "holiday_calendar_error": holiday_meta.get("error"),
+        "holiday_count_in_range": holiday_meta.get("holiday_count_in_range", 0),
+        "coverage_pct": (
+            (observed / expected_trading_days) * 100.0
+            if expected_trading_days else None
+        ),
+        "integrity": integrity,
     }
 
 
@@ -1995,6 +2373,13 @@ def _get_historical_equity(symbol, from_date, to_date, series="EQ"):
 
         cursor = chunk_end + timedelta(days=1)
 
+    primary_integrity = _historical_integrity_report(
+        chunks,
+        expected_symbol=symbol_name,
+        start=start,
+        end=end,
+    )
+
     dedup = {}
     for row in chunks:
         row_date = _historical_row_date(row)
@@ -2007,14 +2392,24 @@ def _get_historical_equity(symbol, from_date, to_date, series="EQ"):
     )
 
     expected_weekdays = _historical_expected_weekdays(start, end)
+    expected_trading_days = primary_integrity.get("expected_trading_days")
     primary_valid = bool(primary_rows)
     primary_complete_enough = (
         primary_valid
-        and expected_weekdays is not None
-        and len(primary_rows) >= max(1, int(expected_weekdays * 0.80))
+        and expected_trading_days is not None
+        and len(primary_rows) >= max(1, int(expected_trading_days * 0.80))
     )
 
-    if primary_valid and primary_complete_enough and not primary_errors:
+    primary_integrity_ok = (
+        primary_integrity.get("date_integrity") == "VALID"
+    )
+
+    if (
+        primary_valid
+        and primary_complete_enough
+        and not primary_errors
+        and primary_integrity_ok
+    ):
         result = {
             "source": "NSE",
             "symbol": symbol_name,
@@ -2027,11 +2422,14 @@ def _get_historical_equity(symbol, from_date, to_date, series="EQ"):
             "fallback_used": False,
             "data_quality": "VALID",
             "expected_weekdays": expected_weekdays,
+            "expected_trading_days": expected_trading_days,
             "valid_observations": len(primary_rows),
             "invalid_primary_rows": invalid_primary_rows,
             "fallback_error_count": 0,
             "primary_errors": [],
             "primary_transport": sorted(set(primary_transport)),
+            "coverage_pct": primary_integrity.get("coverage_pct"),
+            "integrity": primary_integrity,
         }
         with _HISTORICAL_CACHE_LOCK:
             _HISTORICAL_CACHE[cache_key] = result
@@ -2046,14 +2444,16 @@ def _get_historical_equity(symbol, from_date, to_date, series="EQ"):
     fallback["primary_errors"] = primary_errors[:50]
     fallback["invalid_primary_rows"] = invalid_primary_rows
     fallback["primary_transport"] = sorted(set(primary_transport))
-    expected = fallback.get("expected_weekdays")
+    fallback["primary_integrity"] = primary_integrity
+
     observed = fallback.get("count", 0)
+    fallback_integrity = fallback.get("integrity", {})
 
     if observed:
         fallback["data_quality"] = (
-            "PARTIAL"
-            if expected and observed < max(1, int(expected * 0.80))
-            else "VALID"
+            "VALID"
+            if fallback_integrity.get("date_integrity") == "VALID"
+            else "INVALID"
         )
     else:
         fallback["data_quality"] = "UNAVAILABLE"
@@ -2103,6 +2503,57 @@ def nse_historical_equity(
         )
 
 
+@app.get("/nse/historical-validation")
+def nse_historical_validation(
+    symbol: str = Query(..., description="NSE equity symbol"),
+    from_date: str | None = Query(None, description="Optional start date"),
+    to_date: str | None = Query(None, description="Optional end date"),
+    series: str = Query("EQ", description="NSE equity series"),
+):
+    """
+    Return only the validation/diagnostic layer for a historical request.
+
+    This endpoint is intended for hand-validation of source integrity before
+    the data is used by screening or investment logic.
+    """
+    try:
+        result = _get_historical_equity(
+            symbol, from_date, to_date, series
+        )
+        return {
+            "source": result.get("source"),
+            "symbol": result.get("symbol"),
+            "series": result.get("series"),
+            "from_date": result.get("from_date"),
+            "to_date": result.get("to_date"),
+            "count": result.get("count"),
+            "data_quality": result.get("data_quality"),
+            "fallback_used": result.get("fallback_used"),
+            "expected_weekdays": result.get("expected_weekdays"),
+            "expected_trading_days": result.get("expected_trading_days"),
+            "valid_observations": result.get("valid_observations"),
+            "coverage_pct": result.get("coverage_pct"),
+            "holiday_calendar_source": result.get("holiday_calendar_source"),
+            "holiday_calendar_error": result.get("holiday_calendar_error"),
+            "holiday_count_in_range": result.get("holiday_count_in_range"),
+            "integrity": result.get("integrity"),
+            "primary_integrity": result.get("primary_integrity"),
+            "primary_errors": result.get("primary_errors", []),
+            "invalid_primary_rows": result.get("invalid_primary_rows", 0),
+            "fallback_errors": result.get("fallback_errors", []),
+            "unavailable_dates_count": result.get("unavailable_dates_count", 0),
+            "invalid_dates_count": result.get("invalid_dates_count", 0),
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"NSE historical validation unavailable for "
+                f"'{symbol}'. Underlying error: {str(e)}"
+            ),
+        )
+
+
 @app.get("/nse/historical-summary")
 def nse_historical_summary(
     symbol: str = Query(..., description="NSE equity symbol"),
@@ -2126,6 +2577,8 @@ def nse_historical_summary(
             return None
 
         closes = []
+        intraday_highs = []
+        intraday_lows = []
         volumes = []
         values = []
         trades = []
@@ -2137,6 +2590,18 @@ def nse_historical_summary(
             )
             if close is not None and close > 0:
                 closes.append(close)
+
+            high = num(
+                row, "CH_TRADE_HIGH_PRICE", "HIGH_PRICE", "HIGH", "high"
+            )
+            if high is not None and high > 0:
+                intraday_highs.append(high)
+
+            low = num(
+                row, "CH_TRADE_LOW_PRICE", "LOW_PRICE", "LOW", "low"
+            )
+            if low is not None and low > 0:
+                intraday_lows.append(low)
 
             volume = num(
                 row, "CH_TOT_TRADED_QTY", "TTL_TRD_QNTY",
@@ -2213,6 +2678,16 @@ def nse_historical_summary(
                 "period_return_pct": period_return,
                 "annualized_volatility_pct": annualized_vol,
                 "max_drawdown_pct": max_drawdown,
+                "period_high_close": max(closes) if closes else None,
+                "period_low_close": min(closes) if closes else None,
+                "period_intraday_high": (
+                    max(intraday_highs) if intraday_highs else None
+                ),
+                "period_intraday_low": (
+                    min(intraday_lows) if intraday_lows else None
+                ),
+                # Backward-compatible aliases: these now explicitly mean
+                # closing-price extremes, not intraday extremes.
                 "period_high": max(closes) if closes else None,
                 "period_low": min(closes) if closes else None,
                 "avg_daily_volume": (
