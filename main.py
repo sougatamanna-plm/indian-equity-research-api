@@ -1,6 +1,9 @@
 from fastapi import FastAPI, HTTPException, Query
 from datetime import datetime
 import json
+import time
+import requests
+from urllib.parse import quote
 
 from nsedata import nse
 
@@ -26,6 +29,159 @@ def dataframe_to_records(df):
         )
 
     return df
+
+# ---------------------------------------------------------
+# NSE live API session
+# ---------------------------------------------------------
+
+NSE_BASE = "https://www.nseindia.com"
+
+_nse_session = None
+
+
+def get_nse_session():
+    """
+    Create a warmed-up NSE browser-like session.
+    NSE may reject requests that do not first establish
+    a normal website session.
+    """
+    global _nse_session
+
+    if _nse_session is not None:
+        return _nse_session
+
+    session = requests.Session()
+
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/151.0.0.0 Safari/537.36"
+        ),
+        "Accept": (
+            "application/json,text/plain,*/*"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/",
+        "Connection": "keep-alive",
+    })
+
+    # Warm the NSE session before calling the API.
+    response = session.get(
+        NSE_BASE + "/",
+        timeout=20
+    )
+
+    response.raise_for_status()
+
+    time.sleep(1)
+
+    _nse_session = session
+
+    return _nse_session
+
+
+def nse_api_get(path, params=None):
+    """
+    GET an NSE JSON API endpoint using a warmed session.
+    """
+    session = get_nse_session()
+
+    response = session.get(
+        NSE_BASE + path,
+        params=params,
+        timeout=30
+    )
+
+    response.raise_for_status()
+
+    return response.json()
+
+# ---------------------------------------------------------
+# NSE INDEX DISCOVERY
+# ---------------------------------------------------------
+
+@app.get("/nse/index-list")
+def nse_index_list():
+    """
+    Return the currently discoverable NSE index universe
+    from NSE's live all-indices endpoint.
+    """
+    try:
+        payload = nse_api_get("/api/allIndices")
+
+        data = payload.get("data", [])
+
+        # Keep the complete raw records while also providing
+        # a compact discovery list.
+        compact = []
+
+        for item in data:
+            compact.append({
+                "indexSymbol": item.get("indexSymbol"),
+                "index": item.get("index"),
+                "key": item.get("key"),
+                "indexType": item.get("indexType"),
+                "last": item.get("last"),
+                "variation": item.get("variation"),
+                "percentChange": item.get("percentChange"),
+            })
+
+        return {
+            "source": "NSE",
+            "endpoint": "/api/allIndices",
+            "count": len(data),
+            "indices": compact,
+            "raw_available": True,
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"NSE index catalogue error: {str(e)}"
+        )
+
+
+@app.get("/nse/index-constituents")
+def nse_index_constituents(
+    index: str = Query(
+        ...,
+        description=(
+            "NSE index name, e.g. NIFTY 50, "
+            "NIFTY 500, NIFTY MIDCAP 150, NIFTY BANK"
+        )
+    )
+):
+    """
+    Return constituent-level data for a selected NSE index.
+    """
+
+    try:
+        payload = nse_api_get(
+            "/api/equity-stockIndices",
+            params={"index": index}
+        )
+
+        data = payload.get("data", [])
+
+        return {
+            "source": "NSE",
+            "index_requested": index,
+            "count": len(data),
+            "data": data,
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"NSE constituent data unavailable for "
+                f"index '{index}'. "
+                f"Underlying error: {str(e)}"
+            )
+        )
+
+
 
 
 @app.get("/")
