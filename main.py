@@ -7,6 +7,8 @@ from urllib.parse import quote
 
 from nsedata import nse
 
+_nse_session = None
+
 
 app = FastAPI(
     title="Indian Equity Research API",
