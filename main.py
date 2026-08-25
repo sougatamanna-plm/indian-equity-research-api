@@ -49,7 +49,7 @@ INDEX_CONSTITUENT_WORKERS = 4
 app = FastAPI(
     title="Indian Equity Research API",
     description="Free NSE/BSE research data gateway",
-    version="0.6.0"
+    version="0.6.1"
 )
 
 
@@ -1425,6 +1425,88 @@ def _validate_date_range(from_date, to_date, max_days=None):
 # ---------------------------------------------------------
 # Historical equity price data
 # ---------------------------------------------------------
+def _get_historical_equity_chunk(params):
+    """Fetch one NSE historical-equity window with JSON/CSV fallbacks.
+
+    NSE's historical endpoint can return JSON in normal browser/API flows but
+    may return a CSV download (or a non-JSON response) depending on headers,
+    session state and anti-bot handling. Do not force response.json().
+    """
+    path = "/api/historical/cm/equity"
+    last_errors = []
+
+    for attempt in range(3):
+        session = get_nse_session(force_refresh=(attempt > 0))
+        headers = {
+            "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": f"{NSE_BASE}/get-quotes/equity?symbol={params.get('symbol')}",
+            "X-Requested-With": "XMLHttpRequest",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/146.0.0.0 Safari/537.36"
+            ),
+        }
+        try:
+            response = session.get(NSE_BASE + path, params=params, headers=headers, timeout=40)
+            text = response.text.lstrip("\ufeff \r\n\t")
+
+            if response.status_code in {401, 403, 429} or response.status_code >= 500:
+                last_errors.append(f"HTTP {response.status_code}: {text[:300]}")
+                with _NSE_SESSION_LOCK:
+                    global _nse_session
+                    _nse_session = None
+                time.sleep(1.0 + attempt)
+                continue
+
+            response.raise_for_status()
+
+            # Preferred JSON response: {"data": [...]}
+            if text.startswith("{") or text.startswith("["):
+                try:
+                    payload = response.json()
+                    rows = _unwrap_records(payload)
+                    if rows:
+                        return rows
+                    # Preserve an explicit empty valid JSON response.
+                    if isinstance(payload, dict) and "data" in payload:
+                        return rows
+                except ValueError as exc:
+                    last_errors.append(f"JSON parse failed: {exc}")
+
+            # Fallback: NSE supports a CSV download form.
+            csv_params = dict(params)
+            csv_params["csv"] = "true"
+            csv_headers = dict(headers)
+            csv_headers["Accept"] = "text/csv,text/plain,*/*"
+            csv_response = session.get(
+                NSE_BASE + path, params=csv_params, headers=csv_headers, timeout=40
+            )
+            csv_text = csv_response.content.decode("utf-8-sig", errors="replace")
+            if csv_response.ok and csv_text.strip():
+                reader = csv.DictReader(io.StringIO(csv_text))
+                rows = [dict(row) for row in reader]
+                if rows:
+                    return rows
+
+            last_errors.append(
+                f"Non-JSON historical response: status={response.status_code}, "
+                f"content-type={response.headers.get('content-type')}, "
+                f"body={text[:200]!r}"
+            )
+        except Exception as exc:
+            last_errors.append(str(exc))
+            with _NSE_SESSION_LOCK:
+                _nse_session = None
+            time.sleep(1.0 + attempt)
+
+    raise RuntimeError(" | ".join(last_errors))
+
+
 def _get_historical_equity(symbol, from_date, to_date, series="EQ"):
     symbol_name = _normalize_symbol(symbol)
     if not symbol_name:
@@ -1464,8 +1546,7 @@ def _get_historical_equity(symbol, from_date, to_date, series="EQ"):
             "from": _format_nse_date(cursor),
             "to": _format_nse_date(chunk_end),
         }
-        payload = nse_api_get("/api/historical/cm/equity", params=params)
-        rows = _unwrap_records(payload)
+        rows = _get_historical_equity_chunk(params)
         chunks.extend(rows)
         cursor = chunk_end + timedelta(days=1)
 
@@ -1854,6 +1935,19 @@ def nse_index_constituents_validated(
             if symbol:
                 independent_symbols.add(symbol)
 
+    if not exchange_symbols and independent_symbols:
+        validation_status = "independent_source_only"
+    elif exchange_symbols and independent_symbols and exchange_symbols == independent_symbols:
+        validation_status = "validated"
+    else:
+        validation_status = "partial_or_mismatch"
+
+    # For the research pipeline, an independently published Nifty Indices
+    # constituent list is still a valid discovery universe even when NSE's
+    # live constituent API is unavailable. The response makes that distinction
+    # explicit instead of returning an unusable empty universe.
+    effective_symbols = sorted(independent_symbols or exchange_symbols)
+
     return {
         "index": index_name,
         "exchange_source": exchange_result,
@@ -1863,9 +1957,14 @@ def nse_index_constituents_validated(
         "common_symbol_count": len(exchange_symbols & independent_symbols),
         "only_exchange": sorted(exchange_symbols - independent_symbols),
         "only_independent": sorted(independent_symbols - exchange_symbols),
-        "validation_status": (
-            "validated" if exchange_symbols and independent_symbols and exchange_symbols == independent_symbols
-            else "partial_or_mismatch"
+        "validation_status": validation_status,
+        "effective_symbol_count": len(effective_symbols),
+        "effective_symbols": effective_symbols,
+        "effective_source": (
+            "NSE+NSE_Indices" if exchange_symbols and independent_symbols
+            else "NSE_Indices" if independent_symbols
+            else "NSE" if exchange_symbols
+            else "none"
         ),
     }
 
