@@ -1,7 +1,9 @@
 from fastapi import FastAPI, HTTPException, Query
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import time
+import csv
+import io
 import requests
 from urllib.parse import quote
 from threading import Lock
@@ -47,7 +49,7 @@ INDEX_CONSTITUENT_WORKERS = 4
 app = FastAPI(
     title="Indian Equity Research API",
     description="Free NSE/BSE research data gateway",
-    version="0.3.0"
+    version="0.6.0"
 )
 
 
@@ -1341,13 +1343,539 @@ def nse_stock_index_membership(
         )
 
 
+
+# ---------------------------------------------------------
+# Historical price / corporate filing caches
+# ---------------------------------------------------------
+_HISTORICAL_CACHE = {}
+_HISTORICAL_CACHE_LOCK = Lock()
+_CORP_ACTIONS_CACHE = {}
+_CORP_ACTIONS_CACHE_LOCK = Lock()
+_CORP_ANNOUNCEMENTS_CACHE = {}
+_CORP_ANNOUNCEMENTS_CACHE_LOCK = Lock()
+_BOARD_MEETINGS_CACHE = {}
+_BOARD_MEETINGS_CACHE_LOCK = Lock()
+_FINANCIAL_RESULTS_CACHE = {}
+_FINANCIAL_RESULTS_CACHE_LOCK = Lock()
+
+
+# ---------------------------------------------------------
+# Generic helpers for NSE filing / historical endpoints
+# ---------------------------------------------------------
+def _parse_ddmmyyyy(value, field_name):
+    if value is None or str(value).strip() == "":
+        return None
+    raw = str(value).strip()
+    for fmt in ("%d-%m-%Y", "%Y-%m-%d", "%d-%b-%Y"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    raise ValueError(
+        f"Invalid {field_name}. Use DD-MM-YYYY, YYYY-MM-DD, or DD-Mon-YYYY."
+    )
+
+
+def _format_nse_date(value):
+    return value.strftime("%d-%m-%Y") if value else None
+
+
+def _unwrap_records(payload):
+    """Normalize common NSE list/dict response shapes without losing raw data."""
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in (
+            "data", "records", "result", "results", "corporateActions",
+            "announcements", "boardMeetings", "financialResults",
+        ):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                for nested_key in ("data", "records", "result", "results"):
+                    nested = value.get(nested_key)
+                    if isinstance(nested, list):
+                        return nested
+        # Some NSE responses are keyed by category/segment.
+        collected = []
+        for value in payload.values():
+            if isinstance(value, list):
+                collected.extend(value)
+        if collected:
+            return collected
+    return []
+
+
+def _validate_date_range(from_date, to_date, max_days=None):
+    start = _parse_ddmmyyyy(from_date, "from_date")
+    end = _parse_ddmmyyyy(to_date, "to_date")
+    if start and end and start > end:
+        raise ValueError("from_date cannot be later than to_date")
+    if max_days and start and end and (end - start).days > max_days:
+        raise ValueError(
+            f"Requested date range exceeds the {max_days}-day API window. "
+            "Use multiple non-overlapping requests."
+        )
+    return start, end
+
+
+# ---------------------------------------------------------
+# Historical equity price data
+# ---------------------------------------------------------
+def _get_historical_equity(symbol, from_date, to_date, series="EQ"):
+    symbol_name = _normalize_symbol(symbol)
+    if not symbol_name:
+        raise ValueError("A valid NSE equity symbol is required.")
+
+    start = _parse_ddmmyyyy(from_date, "from_date")
+    end = _parse_ddmmyyyy(to_date, "to_date")
+    if start is None:
+        end = end or datetime.now()
+        start = end - timedelta(days=30)
+    if end is None:
+        end = datetime.now()
+    if start > end:
+        raise ValueError("from_date cannot be later than to_date")
+
+    series_name = str(series or "EQ").strip().upper()
+    cache_key = (
+        symbol_name,
+        _format_nse_date(start),
+        _format_nse_date(end),
+        series_name,
+    )
+
+    with _HISTORICAL_CACHE_LOCK:
+        if cache_key in _HISTORICAL_CACHE:
+            return _HISTORICAL_CACHE[cache_key]
+
+    # NSE's historical equity API is commonly limited to roughly one year.
+    # Chunk long requests rather than silently returning incomplete history.
+    chunks = []
+    cursor = start
+    while cursor <= end:
+        chunk_end = min(cursor + timedelta(days=360), end)
+        params = {
+            "symbol": symbol_name,
+            "series": json.dumps([series_name], separators=(",", ":")),
+            "from": _format_nse_date(cursor),
+            "to": _format_nse_date(chunk_end),
+        }
+        payload = nse_api_get("/api/historical/cm/equity", params=params)
+        rows = _unwrap_records(payload)
+        chunks.extend(rows)
+        cursor = chunk_end + timedelta(days=1)
+
+    # De-duplicate by date when an upstream response overlaps a boundary.
+    dedup = {}
+    for row in chunks:
+        if not isinstance(row, dict):
+            continue
+        stamp = (
+            row.get("CH_TIMESTAMP")
+            or row.get("mTIMESTAMP")
+            or row.get("date")
+            or row.get("Date")
+        )
+        key = str(stamp) if stamp is not None else json.dumps(row, sort_keys=True)
+        dedup[key] = row
+
+    rows = list(dedup.values())
+    rows.sort(
+        key=lambda x: str(
+            x.get("CH_TIMESTAMP")
+            or x.get("mTIMESTAMP")
+            or x.get("date")
+            or x.get("Date")
+            or ""
+        )
+    )
+
+    result = {
+        "source": "NSE",
+        "symbol": symbol_name,
+        "series": series_name,
+        "from_date": _format_nse_date(start),
+        "to_date": _format_nse_date(end),
+        "count": len(rows),
+        "endpoint": "/api/historical/cm/equity",
+        "data": rows,
+    }
+    with _HISTORICAL_CACHE_LOCK:
+        _HISTORICAL_CACHE[cache_key] = result
+    return result
+
+
+@app.get("/nse/historical-equity")
+def nse_historical_equity(
+    symbol: str = Query(..., description="NSE equity symbol, e.g. NETWEB, DIXON, KAYNES"),
+    from_date: str | None = Query(None, description="Start date: DD-MM-YYYY or YYYY-MM-DD"),
+    to_date: str | None = Query(None, description="End date: DD-MM-YYYY or YYYY-MM-DD"),
+    series: str = Query("EQ", description="NSE equity series, normally EQ"),
+):
+    """Return daily historical OHLCV/turnover data for an NSE equity."""
+    try:
+        return _get_historical_equity(symbol, from_date, to_date, series)
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"NSE historical equity data unavailable for '{symbol}'. Underlying error: {str(e)}",
+        )
+
+
+@app.get("/nse/historical-summary")
+def nse_historical_summary(
+    symbol: str = Query(..., description="NSE equity symbol"),
+    from_date: str | None = Query(None, description="Optional start date"),
+    to_date: str | None = Query(None, description="Optional end date"),
+    series: str = Query("EQ", description="NSE equity series"),
+):
+    """Return historical data plus research-ready return, volatility and liquidity statistics."""
+    try:
+        result = _get_historical_equity(symbol, from_date, to_date, series)
+        rows = result.get("data", [])
+
+        def num(row, *keys):
+            for key in keys:
+                value = row.get(key) if isinstance(row, dict) else None
+                try:
+                    if value is not None and str(value).strip() != "":
+                        return float(str(value).replace(",", ""))
+                except (TypeError, ValueError):
+                    pass
+            return None
+
+        closes = []
+        volumes = []
+        values = []
+        trades = []
+        for row in rows:
+            close = num(row, "CH_CLOSING_PRICE", "close", "CLOSE")
+            if close is not None:
+                closes.append(close)
+            volume = num(row, "CH_TOT_TRADED_QTY", "volume", "VOLUME")
+            if volume is not None:
+                volumes.append(volume)
+            value = num(row, "CH_TOT_TRADED_VAL", "value", "VALUE")
+            if value is not None:
+                values.append(value)
+            trade_count = num(row, "CH_TOTAL_TRADES", "No of trades", "NO OF TRADES")
+            if trade_count is not None:
+                trades.append(trade_count)
+
+        returns = []
+        for i in range(1, len(closes)):
+            if closes[i - 1]:
+                returns.append((closes[i] / closes[i - 1] - 1.0) * 100.0)
+
+        period_return = None
+        if len(closes) >= 2 and closes[0]:
+            period_return = (closes[-1] / closes[0] - 1.0) * 100.0
+
+        annualized_vol = None
+        if len(returns) >= 2:
+            mean = sum(returns) / len(returns)
+            variance = sum((x - mean) ** 2 for x in returns) / (len(returns) - 1)
+            annualized_vol = (variance ** 0.5) * (252 ** 0.5)
+
+        running_high = None
+        max_drawdown = 0.0
+        for close in closes:
+            running_high = close if running_high is None else max(running_high, close)
+            if running_high:
+                max_drawdown = min(max_drawdown, (close / running_high - 1.0) * 100.0)
+
+        return {
+            **result,
+            "summary": {
+                "period_return_pct": period_return,
+                "annualized_volatility_pct": annualized_vol,
+                "max_drawdown_pct": max_drawdown,
+                "period_high": max(closes) if closes else None,
+                "period_low": min(closes) if closes else None,
+                "avg_daily_volume": (sum(volumes) / len(volumes)) if volumes else None,
+                "avg_daily_traded_value": (sum(values) / len(values)) if values else None,
+                "avg_daily_trades": (sum(trades) / len(trades)) if trades else None,
+            },
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"NSE historical summary unavailable for '{symbol}'. Underlying error: {str(e)}",
+        )
+
+
+# ---------------------------------------------------------
+# Corporate actions / announcements / board meetings / results
+# ---------------------------------------------------------
+def _filing_params(symbol=None, from_date=None, to_date=None, index="equities"):
+    params = {"index": index}
+    if symbol:
+        params["symbol"] = _normalize_symbol(symbol)
+    if from_date:
+        start = _parse_ddmmyyyy(from_date, "from_date")
+        params["from_date"] = _format_nse_date(start)
+    if to_date:
+        end = _parse_ddmmyyyy(to_date, "to_date")
+        params["to_date"] = _format_nse_date(end)
+    if from_date and to_date:
+        start = _parse_ddmmyyyy(from_date, "from_date")
+        end = _parse_ddmmyyyy(to_date, "to_date")
+        if start > end:
+            raise ValueError("from_date cannot be later than to_date")
+    return params
+
+
+def _get_corporate_actions(symbol=None, from_date=None, to_date=None, index="equities"):
+    key = (str(symbol or "").upper(), from_date, to_date, index)
+    with _CORP_ACTIONS_CACHE_LOCK:
+        if key in _CORP_ACTIONS_CACHE:
+            return _CORP_ACTIONS_CACHE[key]
+
+    params = _filing_params(symbol, from_date, to_date, index)
+    errors = []
+    for path in ("/api/corporates-corporateActions", "/api/corporate-actions"):
+        try:
+            payload = nse_api_get(path, params=params)
+            result = {
+                "source": "NSE",
+                "symbol": _normalize_symbol(symbol) if symbol else None,
+                "endpoint": path,
+                "count": len(_unwrap_records(payload)),
+                "data": _unwrap_records(payload),
+                "raw": payload,
+            }
+            with _CORP_ACTIONS_CACHE_LOCK:
+                _CORP_ACTIONS_CACHE[key] = result
+            return result
+        except Exception as e:
+            errors.append(f"{path}: {str(e)}")
+    raise RuntimeError("Corporate actions unavailable | " + " | ".join(errors))
+
+
+@app.get("/nse/corporate-actions")
+def nse_corporate_actions(
+    symbol: str | None = Query(None, description="Optional NSE symbol filter"),
+    from_date: str | None = Query(None, description="Optional start date"),
+    to_date: str | None = Query(None, description="Optional end date"),
+    index: str = Query("equities", description="NSE segment: equities or sme"),
+):
+    """Return NSE corporate actions such as dividends, splits, bonus and rights."""
+    try:
+        return _get_corporate_actions(symbol, from_date, to_date, index)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"NSE corporate actions unavailable. Underlying error: {str(e)}")
+
+
+def _get_corporate_announcements(symbol=None, from_date=None, to_date=None, index="equities", page=1, size=100):
+    key = (str(symbol or "").upper(), from_date, to_date, index, int(page), int(size))
+    with _CORP_ANNOUNCEMENTS_CACHE_LOCK:
+        if key in _CORP_ANNOUNCEMENTS_CACHE:
+            return _CORP_ANNOUNCEMENTS_CACHE[key]
+
+    params = _filing_params(symbol, from_date, to_date, index)
+    params.update({"page": int(page), "size": int(size)})
+    payload = nse_api_get("/api/corporate-announcements", params=params)
+    rows = _unwrap_records(payload)
+    result = {
+        "source": "NSE",
+        "symbol": _normalize_symbol(symbol) if symbol else None,
+        "endpoint": "/api/corporate-announcements",
+        "page": int(page),
+        "size": int(size),
+        "count": len(rows),
+        "data": rows,
+        "raw": payload,
+    }
+    with _CORP_ANNOUNCEMENTS_CACHE_LOCK:
+        _CORP_ANNOUNCEMENTS_CACHE[key] = result
+    return result
+
+
+@app.get("/nse/corporate-announcements")
+def nse_corporate_announcements(
+    symbol: str | None = Query(None, description="Optional NSE symbol filter"),
+    from_date: str | None = Query(None, description="Optional start date"),
+    to_date: str | None = Query(None, description="Optional end date"),
+    index: str = Query("equities", description="NSE segment"),
+    page: int = Query(1, ge=1, description="NSE filing page"),
+    size: int = Query(100, ge=1, le=200, description="Rows per page"),
+):
+    """Return NSE corporate announcements/disclosures, including attachment metadata."""
+    try:
+        return _get_corporate_announcements(symbol, from_date, to_date, index, page, size)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"NSE corporate announcements unavailable. Underlying error: {str(e)}")
+
+
+@app.get("/nse/board-meetings")
+def nse_board_meetings(
+    symbol: str | None = Query(None, description="Optional NSE symbol filter"),
+    from_date: str | None = Query(None, description="Optional start date"),
+    to_date: str | None = Query(None, description="Optional end date"),
+    index: str = Query("equities", description="NSE segment"),
+):
+    """Return NSE board-meeting filings."""
+    try:
+        key = (str(symbol or "").upper(), from_date, to_date, index)
+        with _BOARD_MEETINGS_CACHE_LOCK:
+            if key in _BOARD_MEETINGS_CACHE:
+                return _BOARD_MEETINGS_CACHE[key]
+        params = _filing_params(symbol, from_date, to_date, index)
+        payload = nse_api_get("/api/event-calendar", params=params)
+        rows = _unwrap_records(payload)
+        result = {
+            "source": "NSE",
+            "symbol": _normalize_symbol(symbol) if symbol else None,
+            "endpoint": "/api/event-calendar",
+            "count": len(rows),
+            "data": rows,
+            "raw": payload,
+        }
+        with _BOARD_MEETINGS_CACHE_LOCK:
+            _BOARD_MEETINGS_CACHE[key] = result
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"NSE board-meeting data unavailable. Underlying error: {str(e)}")
+
+
+@app.get("/nse/financial-results-filings")
+def nse_financial_results_filings(
+    symbol: str | None = Query(None, description="Optional NSE symbol filter"),
+    from_date: str | None = Query(None, description="Optional broadcast start date"),
+    to_date: str | None = Query(None, description="Optional broadcast end date"),
+    period: str = Query("quarterly", description="quarterly, annual or half-yearly"),
+    index: str = Query("equities", description="NSE segment"),
+):
+    """Return NSE financial-result filing metadata; numeric P&L is not assumed to be present."""
+    try:
+        if period not in {"quarterly", "annual", "half-yearly"}:
+            raise ValueError("period must be quarterly, annual or half-yearly")
+        key = (str(symbol or "").upper(), from_date, to_date, period, index)
+        with _FINANCIAL_RESULTS_CACHE_LOCK:
+            if key in _FINANCIAL_RESULTS_CACHE:
+                return _FINANCIAL_RESULTS_CACHE[key]
+        params = _filing_params(symbol, from_date, to_date, index)
+        params["period"] = period
+        payload = nse_api_get("/api/corporates-financial-results", params=params)
+        rows = _unwrap_records(payload)
+        result = {
+            "source": "NSE",
+            "symbol": _normalize_symbol(symbol) if symbol else None,
+            "endpoint": "/api/corporates-financial-results",
+            "period": period,
+            "count": len(rows),
+            "data": rows,
+            "raw": payload,
+        }
+        with _FINANCIAL_RESULTS_CACHE_LOCK:
+            _FINANCIAL_RESULTS_CACHE[key] = result
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"NSE financial-results filings unavailable. Underlying error: {str(e)}")
+
+
+# ---------------------------------------------------------
+# Index constituent cross-validation
+# ---------------------------------------------------------
+# Nifty Indices publishes constituent downloads for its equity indices. The
+# exchange API remains the primary source; these URLs are an independent
+# validation route for the most important broad-market indices.
+NIFTY_CONSTITUENT_CSVS = {
+    "NIFTY 50": "https://www.niftyindices.com/IndexConstituent/ind_nifty50list.csv",
+    "NIFTY 100": "https://www.niftyindices.com/IndexConstituent/ind_nifty100list.csv",
+    "NIFTY 200": "https://www.niftyindices.com/IndexConstituent/ind_nifty200list.csv",
+    "NIFTY 500": "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv",
+    "NIFTY MIDCAP 150": "https://www.niftyindices.com/IndexConstituent/ind_niftymidcap150list.csv",
+    "NIFTY SMALLCAP 250": "https://www.niftyindices.com/IndexConstituent/ind_niftysmallcap250list.csv",
+    "NIFTY MICROCAP 250": "https://www.niftyindices.com/IndexConstituent/ind_niftymicrocap250list.csv",
+}
+
+
+def _get_niftyindices_constituents(index_name):
+    index_name = _normalize_index_name(index_name)
+    url = NIFTY_CONSTITUENT_CSVS.get(index_name)
+    if not url:
+        return {
+            "source": "NSE Indices",
+            "index": index_name,
+            "count": 0,
+            "data": [],
+            "error": "No independent CSV mapping configured for this index",
+        }
+    response = requests.get(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/146 Safari/537.36",
+            "Accept": "text/csv,text/plain,*/*",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    reader = csv.DictReader(io.StringIO(response.content.decode("utf-8-sig", errors="replace")))
+    rows = [dict(row) for row in reader]
+    return {
+        "source": "NSE Indices",
+        "index": index_name,
+        "endpoint": url,
+        "count": len(rows),
+        "data": rows,
+    }
+
+
+@app.get("/nse/index-constituents-validated")
+def nse_index_constituents_validated(
+    index: str = Query(..., description="Index, e.g. NIFTY 500 or NIFTY 50"),
+):
+    """Cross-check an index constituent list using NSE and, for mapped indices, NSE Indices CSV."""
+    index_name = _normalize_index_name(index)
+    if not index_name:
+        raise HTTPException(status_code=400, detail="A valid NSE index name is required.")
+
+    exchange_result = _get_index_constituents_cached(index_name)
+    independent = _get_niftyindices_constituents(index_name)
+
+    exchange_symbols = set()
+    for row in exchange_result.get("data", []):
+        if isinstance(row, dict):
+            symbol = _normalize_symbol(row.get("symbol") or row.get("Symbol"))
+            if symbol:
+                exchange_symbols.add(symbol)
+
+    independent_symbols = set()
+    for row in independent.get("data", []):
+        if isinstance(row, dict):
+            symbol = _normalize_symbol(
+                row.get("Symbol") or row.get("SYMBOL") or row.get("symbol")
+            )
+            if symbol:
+                independent_symbols.add(symbol)
+
+    return {
+        "index": index_name,
+        "exchange_source": exchange_result,
+        "independent_source": independent,
+        "exchange_symbol_count": len(exchange_symbols),
+        "independent_symbol_count": len(independent_symbols),
+        "common_symbol_count": len(exchange_symbols & independent_symbols),
+        "only_exchange": sorted(exchange_symbols - independent_symbols),
+        "only_independent": sorted(independent_symbols - exchange_symbols),
+        "validation_status": (
+            "validated" if exchange_symbols and independent_symbols and exchange_symbols == independent_symbols
+            else "partial_or_mismatch"
+        ),
+    }
+
 @app.get("/")
 def root():
     return {
         "service": "Indian Equity Research API",
         "status": "online",
-        "version": "0.5.0",
-        "data_layers": ["NSE", "equity-quote", "equity-meta-info", "master-universe", "index-catalogue", "index-constituents", "index-union", "master-discovery", "index-membership"],
+        "version": "0.6.0",
+        "data_layers": ["NSE", "equity-quote", "equity-meta-info", "master-universe", "index-catalogue", "index-constituents", "index-union", "master-discovery", "index-membership", "historical-equity", "historical-summary", "corporate-actions", "corporate-announcements", "board-meetings", "financial-results-filings", "index-constituents-validated"],
     }
 
 
