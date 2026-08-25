@@ -7,6 +7,7 @@ from urllib.parse import quote
 
 from nsedata import nse
 
+NSE_BASE = "https://www.nseindia.com"
 _nse_session = None
 
 
