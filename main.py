@@ -203,23 +203,62 @@ def nse_mutual_fund(
     )
 ):
     """
-    NSE mutual-fund dataset exposed by nse-archives.
+    Dynamically discover the current NSE mutual-fund dataset
+    instead of assuming a hard-coded dataset key.
     """
     try:
+        datasets = nse.list_datasets()
+
+        mf = datasets[
+            (datasets["category"] == "capital_market") &
+            (datasets["subcategory"] == "mutual_fund")
+        ]
+
+        if mf.empty:
+            raise HTTPException(
+                status_code=404,
+                detail="No NSE mutual-fund dataset is currently listed."
+            )
+
+        dataset_row = mf.iloc[0]
+
+        dataset_key = dataset_row["dataset"]
+        dataset_name = dataset_row["name"]
+        df_supported = dataset_row["df_supported"]
+
+        if not bool(df_supported):
+            return {
+                "source": "NSE",
+                "subcategory": "mutual_fund",
+                "dataset": dataset_key,
+                "name": dataset_name,
+                "df_supported": False,
+                "message": (
+                    "The current NSE mutual-fund dataset is listed, "
+                    "but this package does not expose it through nse.get(). "
+                    "A download-based implementation may be required."
+                )
+            }
+
         df = nse.get(
             "capital_market",
             "mutual_fund",
-            "mf_eq",
+            dataset_key,
             date
         )
 
         return {
             "source": "NSE",
-            "dataset": "mf_eq",
+            "subcategory": "mutual_fund",
+            "dataset": dataset_key,
+            "name": dataset_name,
             "date": date,
             "count": len(df),
             "data": dataframe_to_records(df)
         }
+
+    except HTTPException:
+        raise
 
     except Exception as e:
         raise HTTPException(
