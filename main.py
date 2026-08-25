@@ -142,6 +142,7 @@ def nse_api_get(path, params=None):
 
     return response.json()
 
+
 @app.get("/nse/index-list")
 def nse_index_list():
     """
@@ -195,34 +196,78 @@ def nse_index_constituents(
 ):
     """
     Return constituent-level data for a selected NSE index.
+
+    Try the standard NSE equity-stockIndices endpoint first.
+    If NSE returns an endpoint-level failure, try the newer NextApi
+    infrastructure used by current NSE client implementations.
     """
 
+    index_name = index.strip().upper()
+    errors = []
+
+    # Method 1: standard NSE index constituent endpoint.
     try:
         payload = nse_api_get(
             "/api/equity-stockIndices",
-            params={"index": index}
+            params={"index": index_name}
         )
 
-        data = payload.get("data", [])
+        data = payload.get("data", []) if isinstance(payload, dict) else []
 
         return {
             "source": "NSE",
             "index_requested": index,
+            "index_normalized": index_name,
+            "endpoint": "/api/equity-stockIndices",
             "count": len(data),
             "data": data,
         }
 
     except Exception as e:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"NSE constituent data unavailable for "
-                f"index '{index}'. "
-                f"Underlying error: {str(e)}"
-            )
+        errors.append(f"standard endpoint: {str(e)}")
+
+    # Method 2: current NSE NextApi infrastructure.
+    try:
+        payload = nse_api_get(
+            "/api/NextApi/apiClient/GetQuoteApi",
+            params={
+                "functionName": "getEquityStockIndices",
+                "index": index_name,
+            }
         )
 
+        if isinstance(payload, dict):
+            data = payload.get("data", [])
+        else:
+            data = payload
 
+        if data is None:
+            data = []
+
+        if not isinstance(data, list):
+            data = [data]
+
+        return {
+            "source": "NSE",
+            "index_requested": index,
+            "index_normalized": index_name,
+            "endpoint": "/api/NextApi/apiClient/GetQuoteApi",
+            "functionName": "getEquityStockIndices",
+            "count": len(data),
+            "data": data,
+            "raw": payload,
+        }
+
+    except Exception as e:
+        errors.append(f"NextApi endpoint: {str(e)}")
+
+    raise HTTPException(
+        status_code=502,
+        detail=(
+            f"NSE constituent data unavailable for index '{index}'. "
+            + " | ".join(errors)
+        )
+    )
 
 
 @app.get("/")
