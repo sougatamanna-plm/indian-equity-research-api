@@ -54,7 +54,7 @@ INDEX_CONSTITUENT_WORKERS = 4
 app = FastAPI(
     title="Indian Equity Research API",
     description="Free NSE/BSE research data gateway",
-    version="0.6.4",
+    version="0.6.5",
     docs_url=None,
 )
 
@@ -137,6 +137,54 @@ async def custom_swagger_ui_html():
         box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25) !important;
     }
 
+    /* Keep expanded Try-it-out / Parameters / Responses areas dark. */
+    .swagger-ui .opblock-body,
+    .swagger-ui .opblock-body pre,
+    .swagger-ui .parameters-container,
+    .swagger-ui .responses-wrapper,
+    .swagger-ui .responses-inner,
+    .swagger-ui .response,
+    .swagger-ui .response-col_description,
+    .swagger-ui .response-col_links,
+    .swagger-ui .response-control-media-type,
+    .swagger-ui .response-control-media-type__accept-message,
+    .swagger-ui .execute-wrapper {
+        background: #292a2d !important;
+        color: #e8eaed !important;
+    }
+
+    .swagger-ui .opblock-section-header {
+        background: #242528 !important;
+        border-color: #45464a !important;
+        box-shadow: none !important;
+        color: #e8eaed !important;
+    }
+
+    .swagger-ui .opblock-section-header h4,
+    .swagger-ui .opblock-section-header label,
+    .swagger-ui .opblock-section-header span {
+        color: #e8eaed !important;
+    }
+
+    .swagger-ui .responses-table,
+    .swagger-ui .responses-table tbody tr,
+    .swagger-ui .responses-table tbody tr td,
+    .swagger-ui .responses-table thead tr th,
+    .swagger-ui .responses-table thead tr td {
+        background: #292a2d !important;
+        color: #e8eaed !important;
+        border-color: #45464a !important;
+    }
+
+    .swagger-ui .parameter__name,
+    .swagger-ui .parameter__type,
+    .swagger-ui .parameter__deprecated,
+    .swagger-ui .parameter__in,
+    .swagger-ui .parameter__extension,
+    .swagger-ui .parameter__empty_value_toggle {
+        color: #d7d9dc !important;
+    }
+
     .swagger-ui .opblock .opblock-summary {
         border-color: #45464a !important;
     }
@@ -205,18 +253,23 @@ async def custom_swagger_ui_html():
         color: #aecbfa !important;
     }
 
-    .swagger-ui .btn {
+    .swagger-ui .btn,
+    .swagger-ui .try-out__btn,
+    .swagger-ui .execute-wrapper .btn,
+    .swagger-ui .btn.cancel {
         background: #303134 !important;
         color: #e8eaed !important;
-        border-color: #5f6368 !important;
+        border: 1px solid #5f6368 !important;
+        box-shadow: none !important;
     }
 
+    .swagger-ui .try-out__btn:hover,
+    .swagger-ui .execute-wrapper .btn:hover,
+    .swagger-ui .btn.cancel:hover,
     .swagger-ui .btn:hover {
         background: #3c4043 !important;
-    }
-
-    .swagger-ui .opblock .btn {
-        background: transparent !important;
+        color: #ffffff !important;
+        border-color: #80868b !important;
     }
 
     .swagger-ui .loading-container .loading::after {
@@ -843,9 +896,9 @@ def _build_master_universe(
 
 @app.get("/nse/master-universe")
 def nse_master_universe(
-    date: str = Query(
-        ...,
-        description="Trading date in YYYY-MM-DD format"
+    date: str | None = Query(
+        None,
+        description="Optional trading date in YYYY-MM-DD format; defaults to the latest completed NSE trading day"
     ),
     include_membership: bool = Query(
         False,
@@ -1316,9 +1369,9 @@ def nse_index_union(
 
 @app.get("/nse/master-discovery")
 def nse_master_discovery(
-    date: str = Query(
-        ...,
-        description="Trading date in YYYY-MM-DD format"
+    date: str | None = Query(
+        None,
+        description="Optional trading date in YYYY-MM-DD format; defaults to the latest completed NSE trading day"
     ),
     indices: str = Query(
         "NIFTY 500,NIFTY MIDCAP 150,NIFTY SMALLCAP 250,NIFTY MICROCAP 250",
@@ -1471,7 +1524,13 @@ def nse_master_discovery(
 
     return {
         "source": "NSE",
-        "date": date,
+        "requested_date": master.get("requested_date"),
+        "effective_date": master.get("effective_date"),
+        "date": master.get("effective_date"),
+        "date_adjusted": master.get("date_adjusted"),
+        "adjustment_reason": master.get("adjustment_reason"),
+        "calendar_source": master.get("calendar_source"),
+        "calendar_error": master.get("calendar_error"),
         "master_count": master["count"],
         "index_count": len(unique_indices),
         "indices_requested": unique_indices,
@@ -1964,9 +2023,12 @@ def _is_nse_trading_day(day, holidays):
     return day.weekday() < 5 and day not in holidays
 
 
-def resolve_effective_eod_date(requested_date):
+def resolve_effective_eod_date(requested_date=None):
     """
     Resolve an EOD-data request to the latest completed NSE trading day.
+
+    If no date is supplied, the resolver uses today's IST calendar date and
+    then rolls back to the latest completed NSE trading day.
 
     Rules:
       - A past trading day is preserved.
@@ -1977,18 +2039,26 @@ def resolve_effective_eod_date(requested_date):
     Returns both requested and effective dates so callers never lose
     provenance.
     """
-    raw = str(requested_date).strip()
-    try:
-        requested = datetime.strptime(raw, "%Y-%m-%d").date()
-    except ValueError:
-        raise ValueError("Invalid date. Use YYYY-MM-DD format.")
+    today_ist = datetime.now(_NSE_TIMEZONE).date()
+    raw = "" if requested_date is None else str(requested_date).strip()
+    defaulted = not raw
+
+    if defaulted:
+        requested = today_ist
+    else:
+        try:
+            requested = datetime.strptime(raw, "%Y-%m-%d").date()
+        except ValueError:
+            raise ValueError("Invalid date. Use YYYY-MM-DD format.")
 
     holiday_info = _get_nse_trading_holiday_dates()
     holidays = holiday_info.get("dates", set())
-    today_ist = datetime.now(_NSE_TIMEZONE).date()
 
     candidate = requested
     reasons = []
+
+    if defaulted:
+        reasons.append("date not supplied; using current IST date")
 
     if candidate >= today_ist:
         candidate = today_ist - timedelta(days=1)
@@ -2023,9 +2093,9 @@ def resolve_effective_eod_date(requested_date):
 
 @app.get("/nse/trading-date")
 def nse_trading_date(
-    date: str = Query(
-        ...,
-        description="Requested EOD date in YYYY-MM-DD format"
+    date: str | None = Query(
+        None,
+        description="Optional requested EOD date in YYYY-MM-DD format; defaults to today and resolves to the latest completed NSE trading day"
     )
 ):
     """Diagnostic endpoint for the central NSE effective-EOD date resolver."""
@@ -3463,9 +3533,9 @@ def nse_datasets():
 
 @app.get("/nse/equities")
 def nse_equities(
-    date: str = Query(
-        ...,
-        description="Trading date in YYYY-MM-DD format"
+    date: str | None = Query(
+        None,
+        description="Optional trading date in YYYY-MM-DD format; defaults to the latest completed NSE trading day"
     )
 ):
     """
@@ -3510,9 +3580,9 @@ def nse_equities(
 
 @app.get("/nse/indices")
 def nse_indices(
-    date: str = Query(
-        ...,
-        description="Trading date in YYYY-MM-DD format"
+    date: str | None = Query(
+        None,
+        description="Optional trading date in YYYY-MM-DD format; defaults to the latest completed NSE trading day"
     )
 ):
     """
@@ -3611,9 +3681,9 @@ def nse_block_deals():
 
 @app.get("/nse/mutual-fund")
 def nse_mutual_fund(
-    date: str = Query(
-        ...,
-        description="Trading date in YYYY-MM-DD format"
+    date: str | None = Query(
+        None,
+        description="Optional trading date in YYYY-MM-DD format; defaults to the latest completed NSE trading day"
     )
 ):
     """
@@ -3687,10 +3757,11 @@ def nse_mutual_fund(
         raise HTTPException(status_code=400, detail=str(e))
 
     except Exception as e:
+        requested_label = date if date else "latest completed NSE trading day"
         raise HTTPException(
             status_code=502,
             detail=(
-                f"NSE mutual-fund data unavailable for {date}. "
+                f"NSE mutual-fund data unavailable for {requested_label}. "
                 f"Underlying error: {str(e)}"
             )
         )
