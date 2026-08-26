@@ -49,7 +49,7 @@ INDEX_CONSTITUENT_WORKERS = 4
 app = FastAPI(
     title="Indian Equity Research API",
     description="Free NSE/BSE research data gateway",
-    version="0.6.3"
+    version="0.6.3.1"
 )
 
 
@@ -1928,11 +1928,13 @@ def _historical_expected_weekdays(start, end):
 
 def _get_historical_equity_chunk(params):
     """
-    Primary historical route.
+    Primary historical route with strict transport validation.
 
-    Try NSE JSON first, then the CSV form of the same endpoint. Every
-    response is validated by the caller before it becomes market data.
-    HTML/error pages are never accepted as historical observations.
+    NSE's legacy ``/api/historical/cm/equity`` route can return an HTML
+    404/error page. Feeding that page to ``csv.DictReader`` creates fake
+    dictionaries, which caused the misleading "100 rows / 0 valid market
+    rows" diagnostic. Only genuine JSON or recognizable market CSV is now
+    accepted here.
     """
     path = "/api/historical/cm/equity"
     last_errors = []
@@ -1970,6 +1972,33 @@ def _get_historical_equity_chunk(params):
                 time.sleep(1.0 + attempt)
                 continue
 
+            # IMPORTANT: a 404/HTML page is not CSV. Do not let
+            # csv.DictReader turn an NSE error page into fake rows.
+            if response.status_code == 404:
+                last_errors.append(
+                    "HTTP 404: NSE historical equity endpoint is unavailable "
+                    f"for this request; body={text_body[:300]!r}"
+                )
+                break
+
+            lower_body = text_body[:2000].lower()
+            content_type = (response.headers.get("content-type") or "").lower()
+            if (
+                "text/html" in content_type
+                or lower_body.startswith("<html")
+                or lower_body.startswith("<!doctype")
+                or "resource not found" in lower_body
+                or "service temporarily unavailable" in lower_body
+                or "access denied" in lower_body
+                or "captcha" in lower_body
+            ):
+                last_errors.append(
+                    "NSE historical endpoint returned an HTML/error response: "
+                    f"status={response.status_code}, content-type={content_type}, "
+                    f"body={text_body[:300]!r}"
+                )
+                break
+
             response.raise_for_status()
 
             if text_body.startswith("{") or text_body.startswith("["):
@@ -1999,10 +2028,35 @@ def _get_historical_equity_chunk(params):
             )
 
             if csv_response.ok and csv_text.strip():
-                reader = csv.DictReader(io.StringIO(csv_text))
-                rows = [dict(row) for row in reader]
-                if rows:
-                    return {"rows": rows, "transport": "csv"}
+                csv_probe = csv_text.lstrip().lower()[:2000]
+                csv_content_type = (
+                    csv_response.headers.get("content-type") or ""
+                ).lower()
+                csv_is_html = (
+                    "text/html" in csv_content_type
+                    or csv_probe.startswith("<html")
+                    or csv_probe.startswith("<!doctype")
+                    or "resource not found" in csv_probe
+                    or "service temporarily unavailable" in csv_probe
+                    or "access denied" in csv_probe
+                    or "captcha" in csv_probe
+                )
+                lines = csv_text.lstrip().splitlines()
+                first_line = lines[0] if lines else ""
+                header_upper = first_line.upper()
+                looks_like_market_csv = any(
+                    token in header_upper
+                    for token in (
+                        "DATE", "SYMBOL", "SERIES", "CLOSE",
+                        "CH_CLOSING_PRICE", "OPEN", "HIGH", "LOW",
+                    )
+                )
+
+                if not csv_is_html and looks_like_market_csv:
+                    reader = csv.DictReader(io.StringIO(csv_text))
+                    rows = [dict(row) for row in reader]
+                    if rows:
+                        return {"rows": rows, "transport": "csv"}
 
             last_errors.append(
                 f"Non-usable historical response: "
@@ -2445,6 +2499,9 @@ def _get_historical_equity(symbol, from_date, to_date, series="EQ"):
     fallback["invalid_primary_rows"] = invalid_primary_rows
     fallback["primary_transport"] = sorted(set(primary_transport))
     fallback["primary_integrity"] = primary_integrity
+    fallback["primary_source_status"] = (
+        "UNAVAILABLE" if primary_errors and not primary_rows else "VALID"
+    )
 
     observed = fallback.get("count", 0)
     fallback_integrity = fallback.get("integrity", {})
@@ -2539,6 +2596,7 @@ def nse_historical_validation(
             "integrity": result.get("integrity"),
             "primary_integrity": result.get("primary_integrity"),
             "primary_errors": result.get("primary_errors", []),
+            "primary_source_status": result.get("primary_source_status"),
             "invalid_primary_rows": result.get("invalid_primary_rows", 0),
             "fallback_errors": result.get("fallback_errors", []),
             "unavailable_dates_count": result.get("unavailable_dates_count", 0),
