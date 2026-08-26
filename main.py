@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Query
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import json
 import time
 import csv
@@ -49,7 +50,7 @@ INDEX_CONSTITUENT_WORKERS = 4
 app = FastAPI(
     title="Indian Equity Research API",
     description="Free NSE/BSE research data gateway",
-    version="0.6.3.2"
+    version="0.6.3.1"
 )
 
 
@@ -512,8 +513,11 @@ def _build_master_universe(
         discovery. Use /nse/index-union when the goal is thematic/index
         discovery.
     """
+    date_info = resolve_effective_eod_date(date)
+    effective_date = date_info["effective_date"]
+
     cache_key = (
-        date,
+        effective_date,
         bool(include_membership),
         int(max_symbols) if max_symbols is not None else None,
         int(membership_offset)
@@ -527,14 +531,20 @@ def _build_master_universe(
         "capital_market",
         "equities_sme",
         "sec_bhavdata_full",
-        date
+        effective_date
     )
 
     symbols = _extract_equity_symbols(df)
 
     result = {
         "source": "NSE",
-        "date": date,
+        "requested_date": date_info["requested_date"],
+        "effective_date": effective_date,
+        "date": effective_date,
+        "date_adjusted": date_info["date_adjusted"],
+        "adjustment_reason": date_info["adjustment_reason"],
+        "calendar_source": date_info["calendar_source"],
+        "calendar_error": date_info["calendar_error"],
         "dataset": "sec_bhavdata_full",
         "count": len(symbols),
         "symbols": symbols,
@@ -1360,6 +1370,7 @@ _FINANCIAL_RESULTS_CACHE_LOCK = Lock()
 
 _NSE_TRADING_HOLIDAYS_CACHE = None
 _NSE_TRADING_HOLIDAYS_CACHE_LOCK = Lock()
+_NSE_TIMEZONE = ZoneInfo("Asia/Kolkata")
 
 
 # ---------------------------------------------------------
@@ -1742,6 +1753,81 @@ def _get_nse_trading_holiday_dates():
         _NSE_TRADING_HOLIDAYS_CACHE = result
 
     return result
+
+def _is_nse_trading_day(day, holidays):
+    return day.weekday() < 5 and day not in holidays
+
+
+def resolve_effective_eod_date(requested_date):
+    """
+    Resolve an EOD-data request to the latest completed NSE trading day.
+
+    Rules:
+      - A past trading day is preserved.
+      - A weekend/holiday rolls backward to the previous trading day.
+      - Today is never treated as completed EOD; it rolls backward.
+      - A future date also resolves to the latest completed trading day.
+
+    Returns both requested and effective dates so callers never lose
+    provenance.
+    """
+    raw = str(requested_date).strip()
+    try:
+        requested = datetime.strptime(raw, "%Y-%m-%d").date()
+    except ValueError:
+        raise ValueError("Invalid date. Use YYYY-MM-DD format.")
+
+    holiday_info = _get_nse_trading_holiday_dates()
+    holidays = holiday_info.get("dates", set())
+    today_ist = datetime.now(_NSE_TIMEZONE).date()
+
+    candidate = requested
+    reasons = []
+
+    if candidate >= today_ist:
+        candidate = today_ist - timedelta(days=1)
+        reasons.append("current/future date has no completed EOD")
+
+    while not _is_nse_trading_day(candidate, holidays):
+        if candidate.weekday() >= 5:
+            reasons.append("weekend")
+        elif candidate in holidays:
+            reasons.append("NSE trading holiday")
+        candidate -= timedelta(days=1)
+
+    adjusted = candidate != requested
+
+    if not adjusted and not reasons:
+        reason = "requested date is a completed NSE trading day"
+    elif reasons:
+        reason = "; ".join(dict.fromkeys(reasons))
+    else:
+        reason = "rolled back to latest completed NSE trading day"
+
+    return {
+        "requested_date": requested.isoformat(),
+        "effective_date": candidate.isoformat(),
+        "date_adjusted": adjusted,
+        "adjustment_reason": reason,
+        "calendar_source": holiday_info.get("source"),
+        "calendar_error": holiday_info.get("error"),
+        "today_ist": today_ist.isoformat(),
+    }
+
+
+@app.get("/nse/trading-date")
+def nse_trading_date(
+    date: str = Query(
+        ...,
+        description="Requested EOD date in YYYY-MM-DD format"
+    )
+):
+    """Diagnostic endpoint for the central NSE effective-EOD date resolver."""
+    try:
+        return resolve_effective_eod_date(date)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 
 
 def _historical_expected_trading_dates(start, end):
@@ -3097,7 +3183,7 @@ def root():
     return {
         "service": "Indian Equity Research API",
         "status": "online",
-        "version": "0.6.0",
+        "version": "0.6.4",
         "data_layers": ["NSE", "equity-quote", "equity-meta-info", "master-universe", "index-catalogue", "index-constituents", "index-union", "master-discovery", "index-membership", "historical-equity", "historical-summary", "corporate-actions", "corporate-announcements", "board-meetings", "financial-results-filings", "index-constituents-validated"],
     }
 
@@ -3142,27 +3228,37 @@ def nse_equities(
     NSE full securities bhavcopy with delivery information.
     """
     try:
+        date_info = resolve_effective_eod_date(date)
+        effective_date = date_info["effective_date"]
+
         df = nse.get(
             "capital_market",
             "equities_sme",
             "sec_bhavdata_full",
-            date
+            effective_date
         )
 
         return {
             "source": "NSE",
             "dataset": "sec_bhavdata_full",
-            "date": date,
+            "requested_date": date_info["requested_date"],
+            "effective_date": effective_date,
+            "date": effective_date,
+            "date_adjusted": date_info["date_adjusted"],
+            "adjustment_reason": date_info["adjustment_reason"],
+            "calendar_source": date_info["calendar_source"],
+            "calendar_error": date_info["calendar_error"],
             "count": len(df),
             "data": dataframe_to_records(df)
         }
 
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(
             status_code=502,
             detail=(
-                f"NSE equity data unavailable for {date}. "
-                f"Check that the date is a trading day. "
+                f"NSE equity data unavailable for requested date {date}. "
                 f"Underlying error: {str(e)}"
             )
         )
@@ -3179,27 +3275,37 @@ def nse_indices(
     NSE all-index daily closing data.
     """
     try:
+        date_info = resolve_effective_eod_date(date)
+        effective_date = date_info["effective_date"]
+
         df = nse.get(
             "capital_market",
             "indices",
             "ind_close_all",
-            date
+            effective_date
         )
 
         return {
             "source": "NSE",
             "dataset": "ind_close_all",
-            "date": date,
+            "requested_date": date_info["requested_date"],
+            "effective_date": effective_date,
+            "date": effective_date,
+            "date_adjusted": date_info["date_adjusted"],
+            "adjustment_reason": date_info["adjustment_reason"],
+            "calendar_source": date_info["calendar_source"],
+            "calendar_error": date_info["calendar_error"],
             "count": len(df),
             "data": dataframe_to_records(df)
         }
 
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(
             status_code=502,
             detail=(
-                f"NSE index data unavailable for {date}. "
-                f"Check that the date is a trading day. "
+                f"NSE index data unavailable for requested date {date}. "
                 f"Underlying error: {str(e)}"
             )
         )
@@ -3304,11 +3410,14 @@ def nse_mutual_fund(
                 )
             }
 
+        date_info = resolve_effective_eod_date(date)
+        effective_date = date_info["effective_date"]
+
         df = nse.get(
             "capital_market",
             "mutual_fund",
             dataset_key,
-            date
+            effective_date
         )
 
         return {
@@ -3316,13 +3425,22 @@ def nse_mutual_fund(
             "subcategory": "mutual_fund",
             "dataset": dataset_key,
             "name": dataset_name,
-            "date": date,
+            "requested_date": date_info["requested_date"],
+            "effective_date": effective_date,
+            "date": effective_date,
+            "date_adjusted": date_info["date_adjusted"],
+            "adjustment_reason": date_info["adjustment_reason"],
+            "calendar_source": date_info["calendar_source"],
+            "calendar_error": date_info["calendar_error"],
             "count": len(df),
             "data": dataframe_to_records(df)
         }
 
     except HTTPException:
         raise
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     except Exception as e:
         raise HTTPException(
