@@ -1,4 +1,8 @@
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.openapi.docs import (
+    get_swagger_ui_html,
+    get_swagger_ui_oauth2_redirect_html,
+)
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import json
@@ -50,8 +54,210 @@ INDEX_CONSTITUENT_WORKERS = 4
 app = FastAPI(
     title="Indian Equity Research API",
     description="Free NSE/BSE research data gateway",
-    version="0.6.3.2"
+    version="0.6.4",
+    docs_url=None,
 )
+
+
+# ---------------------------------------------------------
+# Custom low-glare Swagger UI
+# ---------------------------------------------------------
+# FastAPI's normal /docs page is disabled above so we can inject a
+# dark/charcoal stylesheet while keeping the standard Swagger UI,
+# OpenAPI schema, Try-it-out functionality, and all API routes intact.
+@app.get("/docs", include_in_schema=False)
+async def custom_swagger_ui_html():
+    response = get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=app.title + " - Swagger UI",
+        oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
+        swagger_ui_parameters={
+            "syntaxHighlight": {
+                "theme": "obsidian"
+            }
+        },
+    )
+
+    html = response.body.decode("utf-8")
+
+    dark_css = """
+<style>
+    :root {
+        color-scheme: dark;
+    }
+
+    html, body {
+        background: #202124 !important;
+        color: #e8eaed !important;
+    }
+
+    body {
+        margin: 0 !important;
+    }
+
+    .swagger-ui {
+        color: #e8eaed !important;
+    }
+
+    .swagger-ui .topbar {
+        background: #17181a !important;
+        border-bottom: 1px solid #3c4043 !important;
+    }
+
+    .swagger-ui .info {
+        margin: 30px 0 !important;
+    }
+
+    .swagger-ui .info .title,
+    .swagger-ui .info p,
+    .swagger-ui .info li,
+    .swagger-ui .info table,
+    .swagger-ui .info h1,
+    .swagger-ui .info h2,
+    .swagger-ui .info h3,
+    .swagger-ui .info h4 {
+        color: #e8eaed !important;
+    }
+
+    .swagger-ui .scheme-container,
+    .swagger-ui .opblock-tag-section,
+    .swagger-ui section.models {
+        background: #202124 !important;
+        box-shadow: none !important;
+    }
+
+    .swagger-ui .opblock-tag {
+        color: #e8eaed !important;
+        border-bottom-color: #3c4043 !important;
+    }
+
+    .swagger-ui .opblock {
+        background: #292a2d !important;
+        border-color: #45464a !important;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25) !important;
+    }
+
+    .swagger-ui .opblock .opblock-summary {
+        border-color: #45464a !important;
+    }
+
+    .swagger-ui .opblock .opblock-summary-description,
+    .swagger-ui .opblock .opblock-summary-path,
+    .swagger-ui .opblock .opblock-summary-path__deprecated,
+    .swagger-ui .opblock-description-wrapper p,
+    .swagger-ui .opblock-external-docs-wrapper,
+    .swagger-ui .opblock-title_normal {
+        color: #d7d9dc !important;
+    }
+
+    .swagger-ui label,
+    .swagger-ui .parameter__name,
+    .swagger-ui .parameter__type,
+    .swagger-ui .response-col_status,
+    .swagger-ui .response-col_links,
+    .swagger-ui table thead tr th,
+    .swagger-ui table thead tr td {
+        color: #e8eaed !important;
+    }
+
+    .swagger-ui .model-title,
+    .swagger-ui .model,
+    .swagger-ui section.models h4 {
+        color: #e8eaed !important;
+    }
+
+    .swagger-ui .model-box,
+    .swagger-ui .model-container {
+        background: #292a2d !important;
+    }
+
+    .swagger-ui input[type=text],
+    .swagger-ui textarea,
+    .swagger-ui select {
+        background: #303134 !important;
+        color: #f1f3f4 !important;
+        border: 1px solid #5f6368 !important;
+    }
+
+    .swagger-ui input::placeholder,
+    .swagger-ui textarea::placeholder {
+        color: #9aa0a6 !important;
+    }
+
+    .swagger-ui .highlight-code,
+    .swagger-ui .microlight,
+    .swagger-ui pre {
+        background: #17181a !important;
+        color: #e8eaed !important;
+    }
+
+    .swagger-ui .response-col_description__inner p,
+    .swagger-ui .renderedMarkdown p,
+    .swagger-ui .renderedMarkdown li {
+        color: #d7d9dc !important;
+    }
+
+    .swagger-ui a {
+        color: #8ab4f8 !important;
+    }
+
+    .swagger-ui a:hover {
+        color: #aecbfa !important;
+    }
+
+    .swagger-ui .btn {
+        background: #303134 !important;
+        color: #e8eaed !important;
+        border-color: #5f6368 !important;
+    }
+
+    .swagger-ui .btn:hover {
+        background: #3c4043 !important;
+    }
+
+    .swagger-ui .opblock .btn {
+        background: transparent !important;
+    }
+
+    .swagger-ui .loading-container .loading::after {
+        border-color: #8ab4f8 transparent #8ab4f8 transparent !important;
+    }
+
+    .swagger-ui .responses-inner h4,
+    .swagger-ui .responses-inner h5 {
+        color: #e8eaed !important;
+    }
+
+    .swagger-ui .tab li {
+        color: #bdc1c6 !important;
+    }
+
+    .swagger-ui .tab li.active {
+        color: #8ab4f8 !important;
+    }
+
+    .swagger-ui .servers > label,
+    .swagger-ui .servers-title {
+        color: #e8eaed !important;
+    }
+
+    .swagger-ui .servers select {
+        background: #303134 !important;
+        color: #e8eaed !important;
+        border-color: #5f6368 !important;
+    }
+</style>
+"""
+
+    html = html.replace("</head>", dark_css + "\n</head>", 1)
+    response.body = html.encode("utf-8")
+    response.headers["content-length"] = str(len(response.body))
+    return response
+
+
+@app.get(app.swagger_ui_oauth2_redirect_url, include_in_schema=False)
+async def swagger_ui_redirect():
+    return get_swagger_ui_oauth2_redirect_html()
 
 
 def dataframe_to_records(df):
