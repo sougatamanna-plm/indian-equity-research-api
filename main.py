@@ -50,7 +50,7 @@ INDEX_CONSTITUENT_WORKERS = 4
 app = FastAPI(
     title="Indian Equity Research API",
     description="Free NSE/BSE research data gateway",
-    version="0.6.3.1"
+    version="0.6.3.2"
 )
 
 
@@ -1999,19 +1999,6 @@ def _historical_expected_weekdays(start, end):
     return count
 
 
-def _historical_expected_weekdays(start, end):
-    if start is None or end is None:
-        return None
-    current = start.date()
-    finish = end.date()
-    count = 0
-    while current <= finish:
-        if current.weekday() < 5:
-            count += 1
-        current += timedelta(days=1)
-    return count
-
-
 def _get_historical_equity_chunk(params):
     """
     Primary historical route with strict transport validation.
@@ -2442,15 +2429,28 @@ def _get_historical_equity(symbol, from_date, to_date, series="EQ"):
         raise ValueError("A valid NSE equity symbol is required.")
 
     start = _parse_ddmmyyyy(from_date, "from_date")
-    end = _parse_ddmmyyyy(to_date, "to_date")
+    requested_end = _parse_ddmmyyyy(to_date, "to_date")
+
+    # Resolve every historical EOD request through the central NSE trading-day
+    # resolver. This prevents today/future/weekend/holiday dates from entering
+    # the historical range and being incorrectly counted as expected EOD rows.
+    requested_end_date = (
+        requested_end.date()
+        if requested_end is not None
+        else datetime.now(_NSE_TIMEZONE).date()
+    )
+    end_info = resolve_effective_eod_date(requested_end_date.isoformat())
+    end = datetime.strptime(
+        end_info["effective_date"], "%Y-%m-%d"
+    )
 
     if start is None:
-        end = end or datetime.now()
         start = end - timedelta(days=30)
-    if end is None:
-        end = datetime.now()
     if start > end:
-        raise ValueError("from_date cannot be later than to_date")
+        raise ValueError(
+            "from_date cannot be later than the effective NSE EOD date "
+            f"({end_info['effective_date']})"
+        )
 
     series_name = str(series or "EQ").strip().upper()
     cache_key = (
@@ -2461,8 +2461,19 @@ def _get_historical_equity(symbol, from_date, to_date, series="EQ"):
     )
 
     with _HISTORICAL_CACHE_LOCK:
-        if cache_key in _HISTORICAL_CACHE:
-            return _HISTORICAL_CACHE[cache_key]
+        cached = _HISTORICAL_CACHE.get(cache_key)
+    if cached is not None:
+        result = dict(cached)
+        result.update({
+            "requested_to_date": end_info["requested_date"],
+            "effective_to_date": end_info["effective_date"],
+            "date_adjusted": end_info["date_adjusted"],
+            "adjustment_reason": end_info["adjustment_reason"],
+            "calendar_source": end_info.get("calendar_source"),
+            "calendar_error": end_info.get("calendar_error"),
+            "today_ist": end_info.get("today_ist"),
+        })
+        return result
 
     chunks = []
     primary_errors = []
@@ -2603,7 +2614,17 @@ def _get_historical_equity(symbol, from_date, to_date, series="EQ"):
             "integrity": primary_integrity,
         }
         with _HISTORICAL_CACHE_LOCK:
-            _HISTORICAL_CACHE[cache_key] = result
+            _HISTORICAL_CACHE[cache_key] = dict(result)
+
+        result.update({
+            "requested_to_date": end_info["requested_date"],
+            "effective_to_date": end_info["effective_date"],
+            "date_adjusted": end_info["date_adjusted"],
+            "adjustment_reason": end_info["adjustment_reason"],
+            "calendar_source": end_info.get("calendar_source"),
+            "calendar_error": end_info.get("calendar_error"),
+            "today_ist": end_info.get("today_ist"),
+        })
         return result
 
     fallback = _get_historical_equity_bhavcopy_fallback(
@@ -2640,7 +2661,17 @@ def _get_historical_equity(symbol, from_date, to_date, series="EQ"):
     )
 
     with _HISTORICAL_CACHE_LOCK:
-        _HISTORICAL_CACHE[cache_key] = fallback
+        _HISTORICAL_CACHE[cache_key] = dict(fallback)
+
+    fallback.update({
+        "requested_to_date": end_info["requested_date"],
+        "effective_to_date": end_info["effective_date"],
+        "date_adjusted": end_info["date_adjusted"],
+        "adjustment_reason": end_info["adjustment_reason"],
+        "calendar_source": end_info.get("calendar_source"),
+        "calendar_error": end_info.get("calendar_error"),
+        "today_ist": end_info.get("today_ist"),
+    })
 
     return fallback
 
@@ -2702,6 +2733,13 @@ def nse_historical_validation(
             "series": result.get("series"),
             "from_date": result.get("from_date"),
             "to_date": result.get("to_date"),
+            "requested_to_date": result.get("requested_to_date"),
+            "effective_to_date": result.get("effective_to_date"),
+            "date_adjusted": result.get("date_adjusted"),
+            "adjustment_reason": result.get("adjustment_reason"),
+            "calendar_source": result.get("calendar_source"),
+            "calendar_error": result.get("calendar_error"),
+            "today_ist": result.get("today_ist"),
             "count": result.get("count"),
             "data_quality": result.get("data_quality"),
             "fallback_used": result.get("fallback_used"),
