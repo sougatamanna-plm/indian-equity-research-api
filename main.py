@@ -49,7 +49,7 @@ INDEX_CONSTITUENT_WORKERS = 4
 app = FastAPI(
     title="Indian Equity Research API",
     description="Free NSE/BSE research data gateway",
-    version="0.6.3.1"
+    version="0.6.3.2"
 )
 
 
@@ -2427,12 +2427,43 @@ def _get_historical_equity(symbol, from_date, to_date, series="EQ"):
 
         cursor = chunk_end + timedelta(days=1)
 
-    primary_integrity = _historical_integrity_report(
-        chunks,
-        expected_symbol=symbol_name,
-        start=start,
-        end=end,
-    )
+    # Do not run the dataset-integrity validator on an unavailable primary
+    # source and then label an empty dataset as date_integrity=VALID.
+    # An empty dataset can be internally consistent but still means that the
+    # primary source supplied no market observations.
+    if primary_errors and not chunks:
+        primary_integrity = {
+            "date_integrity": "UNAVAILABLE",
+            "status": "UNAVAILABLE",
+            "raw_row_count": 0,
+            "unique_date_count": 0,
+            "duplicate_date_count": 0,
+            "duplicate_dates": [],
+            "inconsistent_date_count": 0,
+            "invalid_row_count": invalid_primary_rows,
+            "quality_issue_count": 0,
+            "quality_issue_examples": [],
+            "weekend_date_count": 0,
+            "weekend_dates": [],
+            "holiday_date_count": 0,
+            "holiday_dates": [],
+            "expected_trading_days": None,
+            "missing_expected_dates_count": 0,
+            "missing_expected_dates": [],
+            "unexpected_date_count": 0,
+            "unexpected_dates": [],
+            "coverage_pct": None,
+            "holiday_calendar_source": None,
+            "holiday_calendar_error": None,
+            "holiday_count_in_range": 0,
+        }
+    else:
+        primary_integrity = _historical_integrity_report(
+            chunks,
+            expected_symbol=symbol_name,
+            start=start,
+            end=end,
+        )
 
     dedup = {}
     for row in chunks:
@@ -2500,7 +2531,9 @@ def _get_historical_equity(symbol, from_date, to_date, series="EQ"):
     fallback["primary_transport"] = sorted(set(primary_transport))
     fallback["primary_integrity"] = primary_integrity
     fallback["primary_source_status"] = (
-        "UNAVAILABLE" if primary_errors and not primary_rows else "VALID"
+        "UNAVAILABLE"
+        if primary_errors and not primary_rows
+        else ("PARTIAL" if primary_errors else "VALID")
     )
 
     observed = fallback.get("count", 0)
@@ -2595,6 +2628,10 @@ def nse_historical_validation(
             "holiday_count_in_range": result.get("holiday_count_in_range"),
             "integrity": result.get("integrity"),
             "primary_integrity": result.get("primary_integrity"),
+            "primary_integrity_status": (
+                (result.get("primary_integrity") or {}).get("status")
+                or (result.get("primary_integrity") or {}).get("date_integrity")
+            ),
             "primary_errors": result.get("primary_errors", []),
             "primary_source_status": result.get("primary_source_status"),
             "invalid_primary_rows": result.get("invalid_primary_rows", 0),
