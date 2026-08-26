@@ -816,7 +816,24 @@ def _build_master_universe(
         effective_date
     )
 
-    symbols = _extract_equity_symbols(df)
+    all_symbols = _extract_equity_symbols(df)
+    total_count = len(all_symbols)
+
+    # max_symbols + membership_offset are the public pagination controls for
+    # the master universe. The full universe is still built internally so the
+    # total count remains stable and downstream discovery can request the full
+    # universe with max_symbols=None. When membership enrichment is enabled
+    # without an explicit max_symbols, retain the historical live-call safety cap.
+    offset = max(0, int(membership_offset))
+    if max_symbols is None:
+        if include_membership:
+            limit = min(MASTER_MEMBERSHIP_MAX_SYMBOLS, max(0, total_count - offset))
+        else:
+            limit = max(0, total_count - offset)
+    else:
+        limit = max(0, min(int(max_symbols), max(0, total_count - offset)))
+
+    symbols = all_symbols[offset:offset + limit]
 
     result = {
         "source": "NSE",
@@ -828,7 +845,11 @@ def _build_master_universe(
         "calendar_source": date_info["calendar_source"],
         "calendar_error": date_info["calendar_error"],
         "dataset": "sec_bhavdata_full",
-        "count": len(symbols),
+        "count": total_count,
+        "total_count": total_count,
+        "returned_count": len(symbols),
+        "offset": offset,
+        "limit": limit,
         "symbols": symbols,
         "membership_included": bool(include_membership),
         "membership_strategy": (
@@ -839,17 +860,9 @@ def _build_master_universe(
     }
 
     if include_membership:
-        offset = max(0, int(membership_offset))
-
-        limit = (
-            max_symbols
-            if max_symbols is not None
-            else MASTER_MEMBERSHIP_MAX_SYMBOLS
-        )
-
-        limit = max(1, min(int(limit), len(symbols)))
-
-        selected = symbols[offset:offset + limit]
+        # symbols is already the requested public page. Do not apply the offset
+        # a second time when selecting symbols for membership enrichment.
+        selected = symbols
         membership = {}
 
         with ThreadPoolExecutor(
@@ -927,25 +940,26 @@ def nse_master_universe(
         False,
         description=(
             "Optional stock-to-index enrichment. Keep false for broad "
-            "universe discovery. When true, only max_symbols stocks "
-            "starting at membership_offset are enriched."
+            "universe discovery. When true, the returned max_symbols page "
+            "starting at membership_offset is enriched."
         )
     ),
-    max_symbols: int = Query(
-        MASTER_MEMBERSHIP_MAX_SYMBOLS,
+    max_symbols: int | None = Query(
+        None,
         ge=1,
         le=2000,
         description=(
-            "Maximum number of symbols to enrich when "
-            "include_membership=true."
+            "Maximum number of symbols returned from the master universe. "
+            "When include_membership=true, the returned slice is also enriched. "
+            "Omit for the full universe (or the membership safety cap when enrichment is enabled)."
         )
     ),
     membership_offset: int = Query(
         0,
         ge=0,
         description=(
-            "Starting position in the master symbol list for optional "
-            "membership enrichment."
+            "Starting position in the master symbol list for pagination. "
+            "When include_membership=true, this is also the membership enrichment offset."
         )
     )
 ):
@@ -954,9 +968,11 @@ def nse_master_universe(
 
     Broad mode:
         include_membership=false
+        -> max_symbols and membership_offset paginate the returned symbol list.
 
     Targeted enrichment mode:
-        include_membership=true&max_symbols=5
+        include_membership=true&max_symbols=5&membership_offset=20
+        -> enriches exactly the returned page.
 
     The membership flag is intentionally retained for diagnostics and
     targeted enrichment; it is NOT required for broad discovery.
