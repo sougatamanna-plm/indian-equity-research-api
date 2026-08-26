@@ -54,7 +54,7 @@ INDEX_CONSTITUENT_WORKERS = 4
 app = FastAPI(
     title="Indian Equity Research API",
     description="Free NSE/BSE research data gateway",
-    version="0.6.5",
+    version="0.6.6",
     docs_url=None,
 )
 
@@ -1132,33 +1132,43 @@ def _normalize_index_name(value):
 
 
 def _extract_index_constituents(payload):
-    """
-    Normalize the standard NSE equity-stockIndices response.
-    """
+    """Normalize an index-constituent payload to a list of dictionaries."""
     if isinstance(payload, dict):
         data = payload.get("data", [])
     else:
         data = payload
-
     if data is None:
         return []
-
     if not isinstance(data, list):
         data = [data]
+    return [row for row in data if isinstance(row, dict)]
 
-    return data
+
+def _normalize_constituent_rows(rows):
+    """Normalize NSE/NSE Indices rows so downstream code always has ``symbol``."""
+    normalized = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        item = dict(row)
+        symbol = _normalize_symbol(
+            item.get("symbol") or item.get("Symbol") or item.get("SYMBOL")
+        )
+        if symbol:
+            item["symbol"] = symbol
+            normalized.append(item)
+    return normalized
 
 
 def _get_index_constituents_cached(index_name):
-    index_name = _normalize_index_name(index_name)
+    """Fetch index constituents from NSE, then official NSE Indices CSV fallback.
 
+    The obsolete NextApi ``getEquityStockIndices`` function is deliberately not
+    used because NSE currently returns ``Invalid function`` for it.
+    """
+    index_name = _normalize_index_name(index_name)
     if not index_name:
-        return {
-            "index": index_name,
-            "count": 0,
-            "data": [],
-            "error": "Invalid index name"
-        }
+        return {"index": index_name, "count": 0, "data": [], "error": "Invalid index name"}
 
     with _INDEX_CONSTITUENTS_CACHE_LOCK:
         if index_name in _INDEX_CONSTITUENTS_CACHE:
@@ -1166,66 +1176,51 @@ def _get_index_constituents_cached(index_name):
 
     errors = []
 
+    # Primary: live NSE constituent endpoint.
     try:
         payload = nse_api_get(
             "/api/equity-stockIndices",
             params={"index": index_name}
         )
-
-        data = _extract_index_constituents(payload)
-
-        result = {
-            "source": "NSE",
-            "index": index_name,
-            "endpoint": "/api/equity-stockIndices",
-            "count": len(data),
-            "data": data,
-        }
-
-        with _INDEX_CONSTITUENTS_CACHE_LOCK:
-            _INDEX_CONSTITUENTS_CACHE[index_name] = result
-
-        return result
-
+        data = _normalize_constituent_rows(_extract_index_constituents(payload))
+        if data:
+            result = {
+                "source": "NSE",
+                "index": index_name,
+                "endpoint": "/api/equity-stockIndices",
+                "count": len(data),
+                "data": data,
+                "source_priority": "nse_live",
+            }
+            with _INDEX_CONSTITUENTS_CACHE_LOCK:
+                _INDEX_CONSTITUENTS_CACHE[index_name] = result
+            return result
+        errors.append("standard endpoint: returned no usable constituent rows")
     except Exception as e:
         errors.append(f"standard endpoint: {str(e)}")
 
+    # Fallback: official NSE Indices constituent CSV.
     try:
-        payload = nse_api_get(
-            "/api/NextApi/apiClient/GetQuoteApi",
-            params={
-                "functionName": "getEquityStockIndices",
+        fallback = _get_niftyindices_constituents(index_name)
+        data = _normalize_constituent_rows(fallback.get("data", []))
+        if data:
+            result = {
+                "source": "NSE Indices",
                 "index": index_name,
+                "endpoint": fallback.get("endpoint"),
+                "count": len(data),
+                "data": data,
+                "source_priority": "nse_indices_fallback",
+                "fallback_reason": errors,
             }
-        )
-
-        data = _extract_index_constituents(payload)
-
-        result = {
-            "source": "NSE",
-            "index": index_name,
-            "endpoint": "/api/NextApi/apiClient/GetQuoteApi",
-            "functionName": "getEquityStockIndices",
-            "count": len(data),
-            "data": data,
-            "raw": payload,
-        }
-
-        with _INDEX_CONSTITUENTS_CACHE_LOCK:
-            _INDEX_CONSTITUENTS_CACHE[index_name] = result
-
-        return result
-
+            with _INDEX_CONSTITUENTS_CACHE_LOCK:
+                _INDEX_CONSTITUENTS_CACHE[index_name] = result
+            return result
+        errors.append(f"NSE Indices fallback: {fallback.get('error', 'no usable constituent rows')}")
     except Exception as e:
-        errors.append(f"NextApi endpoint: {str(e)}")
+        errors.append(f"NSE Indices fallback: {str(e)}")
 
-    return {
-        "source": "NSE",
-        "index": index_name,
-        "count": 0,
-        "data": [],
-        "errors": errors,
-    }
+    return {"source": "NSE", "index": index_name, "count": 0, "data": [], "errors": errors}
 
 
 @app.get("/nse/index-constituents")
@@ -3460,7 +3455,13 @@ def _get_niftyindices_constituents(index_name):
     )
     response.raise_for_status()
     reader = csv.DictReader(io.StringIO(response.content.decode("utf-8-sig", errors="replace")))
-    rows = [dict(row) for row in reader]
+    rows = []
+    for raw_row in reader:
+        row = dict(raw_row)
+        symbol = _normalize_symbol(row.get("Symbol") or row.get("SYMBOL") or row.get("symbol"))
+        if symbol:
+            row["symbol"] = symbol
+            rows.append(row)
     return {
         "source": "NSE Indices",
         "index": index_name,
