@@ -87,8 +87,8 @@ async def custom_swagger_ui_html():
     }
 
     html, body {
-        background: #202124 !important;
-        color: #e8eaed !important;
+        background: #1f2023 !important;
+        color: #e6e8eb !important;
     }
 
     body {
@@ -100,8 +100,8 @@ async def custom_swagger_ui_html():
     }
 
     .swagger-ui .topbar {
-        background: #17181a !important;
-        border-bottom: 1px solid #3c4043 !important;
+        background: #17191c !important;
+        border-bottom: 1px solid #3a3d42 !important;
     }
 
     .swagger-ui .info {
@@ -122,7 +122,7 @@ async def custom_swagger_ui_html():
     .swagger-ui .scheme-container,
     .swagger-ui .opblock-tag-section,
     .swagger-ui section.models {
-        background: #202124 !important;
+        background: #1f2023 !important;
         box-shadow: none !important;
     }
 
@@ -132,8 +132,8 @@ async def custom_swagger_ui_html():
     }
 
     .swagger-ui .opblock {
-        background: #292a2d !important;
-        border-color: #45464a !important;
+        background: #292c31 !important;
+        border-color: #464a51 !important;
         box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25) !important;
     }
 
@@ -149,12 +149,12 @@ async def custom_swagger_ui_html():
     .swagger-ui .response-control-media-type,
     .swagger-ui .response-control-media-type__accept-message,
     .swagger-ui .execute-wrapper {
-        background: #292a2d !important;
-        color: #e8eaed !important;
+        background: #24272b !important;
+        color: #e6e8eb !important;
     }
 
     .swagger-ui .opblock-section-header {
-        background: #242528 !important;
+        background: #30343a !important;
         border-color: #45464a !important;
         box-shadow: none !important;
         color: #e8eaed !important;
@@ -166,13 +166,25 @@ async def custom_swagger_ui_html():
         color: #e8eaed !important;
     }
 
+    /* Give the response area its own slightly darker surface so it is
+       visually distinct from the expanded operation/parameter area. */
+    .swagger-ui .responses-wrapper,
+    .swagger-ui .responses-inner {
+        background: #1f2226 !important;
+        border-top: 1px solid #3b4047 !important;
+    }
+
+    .swagger-ui .response-col_description {
+        background: #23262b !important;
+    }
+
     .swagger-ui .responses-table,
     .swagger-ui .responses-table tbody tr,
     .swagger-ui .responses-table tbody tr td,
     .swagger-ui .responses-table thead tr th,
     .swagger-ui .responses-table thead tr td {
-        background: #292a2d !important;
-        color: #e8eaed !important;
+        background: #24272b !important;
+        color: #e6e8eb !important;
         border-color: #45464a !important;
     }
 
@@ -216,14 +228,14 @@ async def custom_swagger_ui_html():
 
     .swagger-ui .model-box,
     .swagger-ui .model-container {
-        background: #292a2d !important;
+        background: #25282d !important;
     }
 
     .swagger-ui input[type=text],
     .swagger-ui textarea,
     .swagger-ui select {
-        background: #303134 !important;
-        color: #f1f3f4 !important;
+        background: #2b2f35 !important;
+        color: #eef0f2 !important;
         border: 1px solid #5f6368 !important;
     }
 
@@ -235,8 +247,8 @@ async def custom_swagger_ui_html():
     .swagger-ui .highlight-code,
     .swagger-ui .microlight,
     .swagger-ui pre {
-        background: #17181a !important;
-        color: #e8eaed !important;
+        background: #15171a !important;
+        color: #e6e8eb !important;
     }
 
     .swagger-ui .response-col_description__inner p,
@@ -255,21 +267,32 @@ async def custom_swagger_ui_html():
 
     .swagger-ui .btn,
     .swagger-ui .try-out__btn,
-    .swagger-ui .execute-wrapper .btn,
     .swagger-ui .btn.cancel {
-        background: #303134 !important;
-        color: #e8eaed !important;
+        background: #2b2f35 !important;
+        color: #e6e8eb !important;
         border: 1px solid #5f6368 !important;
         box-shadow: none !important;
     }
 
+    .swagger-ui .execute-wrapper .btn {
+        background: #3a4a5e !important;
+        color: #f0f3f7 !important;
+        border: 1px solid #65788f !important;
+        box-shadow: none !important;
+    }
+
     .swagger-ui .try-out__btn:hover,
-    .swagger-ui .execute-wrapper .btn:hover,
     .swagger-ui .btn.cancel:hover,
     .swagger-ui .btn:hover {
-        background: #3c4043 !important;
+        background: #41464d !important;
         color: #ffffff !important;
         border-color: #80868b !important;
+    }
+
+    .swagger-ui .execute-wrapper .btn:hover {
+        background: #465b73 !important;
+        color: #ffffff !important;
+        border-color: #8a9bb0 !important;
     }
 
     .swagger-ui .loading-container .loading::after {
@@ -295,8 +318,8 @@ async def custom_swagger_ui_html():
     }
 
     .swagger-ui .servers select {
-        background: #303134 !important;
-        color: #e8eaed !important;
+        background: #2b2f35 !important;
+        color: #e6e8eb !important;
         border-color: #5f6368 !important;
     }
 </style>
