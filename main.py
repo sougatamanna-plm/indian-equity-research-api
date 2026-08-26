@@ -54,7 +54,7 @@ INDEX_CONSTITUENT_WORKERS = 4
 app = FastAPI(
     title="Indian Equity Research API",
     description="Free NSE/BSE research data gateway",
-    version="0.6.5",
+    version="0.6.6",
     docs_url=None,
 )
 
@@ -1069,31 +1069,87 @@ def _get_index_catalogue_cached():
         if _INDEX_LIST_CACHE is not None:
             return _INDEX_LIST_CACHE
 
-    payload = nse_api_get("/api/allIndices")
-    data = payload.get("data", []) if isinstance(payload, dict) else []
+    try:
+        payload = nse_api_get("/api/allIndices")
+        data = payload.get("data", []) if isinstance(payload, dict) else []
 
-    compact = []
+        compact = []
+        for item in data:
+            record = {
+                "indexSymbol": item.get("indexSymbol"),
+                "index": item.get("index"),
+                "key": item.get("key"),
+                "indexType": item.get("indexType"),
+                "last": item.get("last"),
+                "variation": item.get("variation"),
+                "percentChange": item.get("percentChange"),
+            }
+            record["category"] = _classify_index(record)
+            compact.append(record)
 
-    for item in data:
-        record = {
-            "indexSymbol": item.get("indexSymbol"),
-            "index": item.get("index"),
-            "key": item.get("key"),
-            "indexType": item.get("indexType"),
-            "last": item.get("last"),
-            "variation": item.get("variation"),
-            "percentChange": item.get("percentChange"),
+        result = {
+            "source": "NSE",
+            "endpoint": "/api/allIndices",
+            "count": len(data),
+            "indices": compact,
+            "raw_available": True,
         }
-        record["category"] = _classify_index(record)
-        compact.append(record)
+    except Exception as primary_error:
+        # NSE's live index catalogue can be blocked independently of the
+        # public constituent archive. Keep /nse/index-list usable with a
+        # catalogue of the important Nifty equity indices.
+        fallback_names = [
+            "NIFTY 50", "NIFTY NEXT 50", "NIFTY 100", "NIFTY NEXT 100",
+            "NIFTY 200", "NIFTY TOTAL MARKET", "NIFTY 500",
+            "NIFTY500 MULTICAP 50:25:25", "NIFTY500 LARGEMIDSMALL EQUAL-CAP WEIGHTED",
+            "NIFTY MIDCAP 150", "NIFTY MIDCAP 50", "NIFTY MIDCAP SELECT",
+            "NIFTY MIDCAP 100", "NIFTY SMALLCAP 500", "NIFTY SMALLCAP 250",
+            "NIFTY SMALLCAP 50", "NIFTY SMALLCAP 100", "NIFTY MICROCAP 250",
+            "NIFTY LARGEMIDCAP 250", "NIFTY MIDSMALLCAP 400",
+            "NIFTY BANK", "NIFTY FINANCIAL SERVICES",
+            "NIFTY FINANCIAL SERVICES 25/50", "NIFTY FINANCIAL SERVICES EX-BANK",
+            "NIFTY FMCG", "NIFTY HEALTHCARE", "NIFTY HOSPITALS",
+            "NIFTY HOUSING FINANCE", "NIFTY INSURANCE", "NIFTY IT",
+            "NIFTY MEDIA", "NIFTY METAL", "NIFTY NBFC", "NIFTY PHARMA",
+            "NIFTY POWER", "NIFTY PRIVATE BANK", "NIFTY PSU BANK",
+            "NIFTY REALTY", "NIFTY REITS & REALTY", "NIFTY RETAIL",
+            "NIFTY TELECOMMUNICATIONS", "NIFTY CONSUMER DURABLES",
+            "NIFTY OIL AND GAS", "NIFTY CAPITAL GOODS", "NIFTY CHEMICALS",
+            "NIFTY CEMENT", "NIFTY CONSTRUCTION",
+            "NIFTY COMMERCIAL & TRANSPORT SERVICES",
+            "NIFTY CONSUMER SERVICES", "NIFTY INDIA DEFENCE",
+            "NIFTY INDIA DIGITAL", "NIFTY INDIA INFRASTRUCTURE & LOGISTICS",
+            "NIFTY INDIA INTERNET", "NIFTY INDIA MANUFACTURING",
+            "NIFTY INDIA RAILWAYS PSU", "NIFTY INDIA TOURISM",
+            "NIFTY EV & NEW AGE AUTOMOTIVE", "NIFTY ENERGY", "NIFTY INFRASTRUCTURE",
+            "NIFTY COMMODITIES", "NIFTY CPSE", "NIFTY PSE",
+            "NIFTY SERVICES SECTOR", "NIFTY INDIA CONSUMPTION",
+            "NIFTY MNC", "NIFTY MOBILITY", "NIFTY RURAL", "NIFTY CAPITAL MARKETS",
+            "NIFTY INDIA NEW AGE CONSUMPTION", "NIFTY TRANSPORTATION & LOGISTICS",
+            "NIFTY INDIA FPI 150", "NIFTY INDIA PHARMA", "INDIA VIX",
+        ]
+        compact = []
+        for name in fallback_names:
+            record = {
+                "indexSymbol": name,
+                "index": name,
+                "key": name,
+                "indexType": None,
+                "last": None,
+                "variation": None,
+                "percentChange": None,
+            }
+            record["category"] = _classify_index(record)
+            compact.append(record)
 
-    result = {
-        "source": "NSE",
-        "endpoint": "/api/allIndices",
-        "count": len(data),
-        "indices": compact,
-        "raw_available": True,
-    }
+        result = {
+            "source": "NSE_STATIC_FALLBACK",
+            "endpoint": None,
+            "count": len(compact),
+            "indices": compact,
+            "raw_available": False,
+            "fallback_reason": str(primary_error),
+        }
 
     with _INDEX_LIST_CACHE_LOCK:
         _INDEX_LIST_CACHE = result
@@ -1132,33 +1188,43 @@ def _normalize_index_name(value):
 
 
 def _extract_index_constituents(payload):
-    """
-    Normalize the standard NSE equity-stockIndices response.
-    """
+    """Normalize an index-constituent payload to a list of dictionaries."""
     if isinstance(payload, dict):
         data = payload.get("data", [])
     else:
         data = payload
-
     if data is None:
         return []
-
     if not isinstance(data, list):
         data = [data]
+    return [row for row in data if isinstance(row, dict)]
 
-    return data
+
+def _normalize_constituent_rows(rows):
+    """Normalize NSE/NSE Indices rows so downstream code always has ``symbol``."""
+    normalized = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        item = dict(row)
+        symbol = _normalize_symbol(
+            item.get("symbol") or item.get("Symbol") or item.get("SYMBOL")
+        )
+        if symbol:
+            item["symbol"] = symbol
+            normalized.append(item)
+    return normalized
 
 
 def _get_index_constituents_cached(index_name):
-    index_name = _normalize_index_name(index_name)
+    """Fetch index constituents from NSE, then official NSE Indices CSV fallback.
 
+    The obsolete NextApi ``getEquityStockIndices`` function is deliberately not
+    used because NSE currently returns ``Invalid function`` for it.
+    """
+    index_name = _normalize_index_name(index_name)
     if not index_name:
-        return {
-            "index": index_name,
-            "count": 0,
-            "data": [],
-            "error": "Invalid index name"
-        }
+        return {"index": index_name, "count": 0, "data": [], "error": "Invalid index name"}
 
     with _INDEX_CONSTITUENTS_CACHE_LOCK:
         if index_name in _INDEX_CONSTITUENTS_CACHE:
@@ -1166,66 +1232,51 @@ def _get_index_constituents_cached(index_name):
 
     errors = []
 
+    # Primary: live NSE constituent endpoint.
     try:
         payload = nse_api_get(
             "/api/equity-stockIndices",
             params={"index": index_name}
         )
-
-        data = _extract_index_constituents(payload)
-
-        result = {
-            "source": "NSE",
-            "index": index_name,
-            "endpoint": "/api/equity-stockIndices",
-            "count": len(data),
-            "data": data,
-        }
-
-        with _INDEX_CONSTITUENTS_CACHE_LOCK:
-            _INDEX_CONSTITUENTS_CACHE[index_name] = result
-
-        return result
-
+        data = _normalize_constituent_rows(_extract_index_constituents(payload))
+        if data:
+            result = {
+                "source": "NSE",
+                "index": index_name,
+                "endpoint": "/api/equity-stockIndices",
+                "count": len(data),
+                "data": data,
+                "source_priority": "nse_live",
+            }
+            with _INDEX_CONSTITUENTS_CACHE_LOCK:
+                _INDEX_CONSTITUENTS_CACHE[index_name] = result
+            return result
+        errors.append("standard endpoint: returned no usable constituent rows")
     except Exception as e:
         errors.append(f"standard endpoint: {str(e)}")
 
+    # Fallback: official NSE Indices constituent CSV.
     try:
-        payload = nse_api_get(
-            "/api/NextApi/apiClient/GetQuoteApi",
-            params={
-                "functionName": "getEquityStockIndices",
+        fallback = _get_niftyindices_constituents(index_name)
+        data = _normalize_constituent_rows(fallback.get("data", []))
+        if data:
+            result = {
+                "source": "NSE Indices",
                 "index": index_name,
+                "endpoint": fallback.get("endpoint"),
+                "count": len(data),
+                "data": data,
+                "source_priority": "nse_indices_fallback",
+                "fallback_reason": errors,
             }
-        )
-
-        data = _extract_index_constituents(payload)
-
-        result = {
-            "source": "NSE",
-            "index": index_name,
-            "endpoint": "/api/NextApi/apiClient/GetQuoteApi",
-            "functionName": "getEquityStockIndices",
-            "count": len(data),
-            "data": data,
-            "raw": payload,
-        }
-
-        with _INDEX_CONSTITUENTS_CACHE_LOCK:
-            _INDEX_CONSTITUENTS_CACHE[index_name] = result
-
-        return result
-
+            with _INDEX_CONSTITUENTS_CACHE_LOCK:
+                _INDEX_CONSTITUENTS_CACHE[index_name] = result
+            return result
+        errors.append(f"NSE Indices fallback: {fallback.get('error', 'no usable constituent rows')}")
     except Exception as e:
-        errors.append(f"NextApi endpoint: {str(e)}")
+        errors.append(f"NSE Indices fallback: {str(e)}")
 
-    return {
-        "source": "NSE",
-        "index": index_name,
-        "count": 0,
-        "data": [],
-        "errors": errors,
-    }
+    return {"source": "NSE", "index": index_name, "count": 0, "data": [], "errors": errors}
 
 
 @app.get("/nse/index-constituents")
@@ -1266,7 +1317,7 @@ def nse_index_constituents(
         )
 
     return {
-        "source": "NSE",
+        "source": result.get("source", "NSE"),
         "index_requested": index,
         "index_normalized": index_name,
         "endpoint": result.get("endpoint"),
@@ -3428,45 +3479,148 @@ def nse_financial_results_filings(
 # Nifty Indices publishes constituent downloads for its equity indices. The
 # exchange API remains the primary source; these URLs are an independent
 # validation route for the most important broad-market indices.
-NIFTY_CONSTITUENT_CSVS = {
-    "NIFTY 50": "https://www.niftyindices.com/IndexConstituent/ind_nifty50list.csv",
-    "NIFTY 100": "https://www.niftyindices.com/IndexConstituent/ind_nifty100list.csv",
-    "NIFTY 200": "https://www.niftyindices.com/IndexConstituent/ind_nifty200list.csv",
-    "NIFTY 500": "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv",
-    "NIFTY MIDCAP 150": "https://www.niftyindices.com/IndexConstituent/ind_niftymidcap150list.csv",
-    "NIFTY SMALLCAP 250": "https://www.niftyindices.com/IndexConstituent/ind_niftysmallcap250list.csv",
-    "NIFTY MICROCAP 250": "https://www.niftyindices.com/IndexConstituent/ind_niftymicrocap250list.csv",
+# Multi-source constituent downloads.  Render/NSE web API calls can receive
+# 403 responses even when the public archive files remain accessible.  Use
+# NSE's archive hosts first, then the current NSE Indices site as a fallback.
+NIFTY_CONSTITUENT_URLS = {
+    "NIFTY 50": [
+        "https://archives.nseindia.com/content/indices/ind_nifty50list.csv",
+        "https://nsearchives.nseindia.com/content/indices/ind_nifty50list.csv",
+        "https://www.niftyindices.com/IndexConstituent/ind_nifty50list.csv",
+    ],
+    "NIFTY NEXT 50": [
+        "https://archives.nseindia.com/content/indices/ind_niftynext50list.csv",
+        "https://nsearchives.nseindia.com/content/indices/ind_niftynext50list.csv",
+        "https://www.niftyindices.com/IndexConstituent/ind_niftynext50list.csv",
+    ],
+    "NIFTY 100": [
+        "https://archives.nseindia.com/content/indices/ind_nifty100list.csv",
+        "https://nsearchives.nseindia.com/content/indices/ind_nifty100list.csv",
+        "https://www.niftyindices.com/IndexConstituent/ind_nifty100list.csv",
+    ],
+    "NIFTY 200": [
+        "https://archives.nseindia.com/content/indices/ind_nifty200list.csv",
+        "https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv",
+        "https://www.niftyindices.com/IndexConstituent/ind_nifty200list.csv",
+    ],
+    "NIFTY 500": [
+        "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",
+        "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv",
+        "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv",
+    ],
+    "NIFTY MIDCAP 50": [
+        "https://archives.nseindia.com/content/indices/ind_niftymidcap50list.csv",
+        "https://nsearchives.nseindia.com/content/indices/ind_niftymidcap50list.csv",
+        "https://www.niftyindices.com/IndexConstituent/ind_niftymidcap50list.csv",
+    ],
+    "NIFTY MIDCAP 100": [
+        "https://archives.nseindia.com/content/indices/ind_niftymidcap100list.csv",
+        "https://nsearchives.nseindia.com/content/indices/ind_niftymidcap100list.csv",
+        "https://www.niftyindices.com/IndexConstituent/ind_niftymidcap100list.csv",
+    ],
+    "NIFTY MIDCAP 150": [
+        "https://archives.nseindia.com/content/indices/ind_niftymidcap150list.csv",
+        "https://nsearchives.nseindia.com/content/indices/ind_niftymidcap150list.csv",
+        "https://www.niftyindices.com/IndexConstituent/ind_niftymidcap150list.csv",
+    ],
+    "NIFTY SMALLCAP 50": [
+        "https://archives.nseindia.com/content/indices/ind_niftysmallcap50list.csv",
+        "https://nsearchives.nseindia.com/content/indices/ind_niftysmallcap50list.csv",
+        "https://www.niftyindices.com/IndexConstituent/ind_niftysmallcap50list.csv",
+    ],
+    "NIFTY SMALLCAP 100": [
+        "https://archives.nseindia.com/content/indices/ind_niftysmallcap100list.csv",
+        "https://nsearchives.nseindia.com/content/indices/ind_niftysmallcap100list.csv",
+        "https://www.niftyindices.com/IndexConstituent/ind_niftysmallcap100list.csv",
+    ],
+    "NIFTY SMALLCAP 250": [
+        "https://archives.nseindia.com/content/indices/ind_niftysmallcap250list.csv",
+        "https://nsearchives.nseindia.com/content/indices/ind_niftysmallcap250list.csv",
+        "https://www.niftyindices.com/IndexConstituent/ind_niftysmallcap250list.csv",
+    ],
+    "NIFTY MICROCAP 250": [
+        "https://archives.nseindia.com/content/indices/ind_niftymicrocap250_list.csv",
+        "https://nsearchives.nseindia.com/content/indices/ind_niftymicrocap250_list.csv",
+        "https://www.niftyindices.com/IndexConstituent/ind_niftymicrocap250list.csv",
+    ],
 }
 
 
 def _get_niftyindices_constituents(index_name):
+    """Fetch an index constituent CSV using resilient official NSE sources."""
     index_name = _normalize_index_name(index_name)
-    url = NIFTY_CONSTITUENT_CSVS.get(index_name)
-    if not url:
+    urls = NIFTY_CONSTITUENT_URLS.get(index_name)
+    if not urls:
         return {
-            "source": "NSE Indices",
+            "source": "NSE Archives",
             "index": index_name,
             "count": 0,
             "data": [],
-            "error": "No independent CSV mapping configured for this index",
+            "error": "No official CSV mapping configured for this index",
         }
-    response = requests.get(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/146 Safari/537.36",
-            "Accept": "text/csv,text/plain,*/*",
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-    reader = csv.DictReader(io.StringIO(response.content.decode("utf-8-sig", errors="replace")))
-    rows = [dict(row) for row in reader]
+
+    errors = []
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/146.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/csv,text/plain,*/*",
+        "Referer": "https://www.nseindia.com/",
+    }
+
+    for url in urls:
+        try:
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+
+            content_type = (response.headers.get("content-type") or "").lower()
+            if "html" in content_type or response.text.lstrip().lower().startswith("<!doctype"):
+                raise RuntimeError(
+                    f"unexpected HTML response (HTTP {response.status_code})"
+                )
+
+            reader = csv.DictReader(
+                io.StringIO(
+                    response.content.decode("utf-8-sig", errors="replace")
+                )
+            )
+            rows = []
+            for raw_row in reader:
+                row = dict(raw_row)
+                symbol = _normalize_symbol(
+                    row.get("Symbol")
+                    or row.get("SYMBOL")
+                    or row.get("symbol")
+                )
+                if symbol:
+                    row["symbol"] = symbol
+                    rows.append(row)
+
+            if rows:
+                return {
+                    "source": (
+                        "NSE Archives"
+                        if "nseindia.com" in url and "niftyindices" not in url
+                        else "NSE Indices"
+                    ),
+                    "index": index_name,
+                    "endpoint": url,
+                    "count": len(rows),
+                    "data": rows,
+                }
+
+            raise RuntimeError("CSV returned no usable constituent rows")
+        except Exception as e:
+            errors.append(f"{url}: {e}")
+
     return {
-        "source": "NSE Indices",
+        "source": "NSE Archives",
         "index": index_name,
-        "endpoint": url,
-        "count": len(rows),
-        "data": rows,
+        "count": 0,
+        "data": [],
+        "errors": errors,
     }
 
 
@@ -3480,7 +3634,16 @@ def nse_index_constituents_validated(
         raise HTTPException(status_code=400, detail="A valid NSE index name is required.")
 
     exchange_result = _get_index_constituents_cached(index_name)
-    independent = _get_niftyindices_constituents(index_name)
+    try:
+        independent = _get_niftyindices_constituents(index_name)
+    except Exception as e:
+        independent = {
+            "source": "NSE Archives",
+            "index": index_name,
+            "count": 0,
+            "data": [],
+            "errors": [str(e)],
+        }
 
     exchange_symbols = set()
     for row in exchange_result.get("data", []):
